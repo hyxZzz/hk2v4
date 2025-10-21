@@ -161,15 +161,19 @@ class ManeuverEnv:
                 aircraft.Heading,
                 owner=0,
             )
-        self.interceptorList.append(interceptor)
-        self.interceptor_pools.setdefault(0, []).append(counter)
-        counter += 1
+            self.interceptorList.append(interceptor)
+            self.interceptor_pools.setdefault(0, []).append(counter)
+            counter += 1
         self.interceptor_remain = self.interceptorNum
 
     # ------------------------------------------------------------------
     # Observation construction
     # ------------------------------------------------------------------
     def _update_observations(self):
+        self.observation_planes.fill(0.0)
+        self.observation_missiles.fill(0.0)
+        self.observation_interceptors.fill(0.0)
+
         for plane_id, aircraft in enumerate(self.aircraftList):
             self.observation_planes[plane_id] = np.array(
                 [
@@ -202,6 +206,8 @@ class ManeuverEnv:
             )
 
         for idx, interceptor in enumerate(self.interceptorList):
+            if idx >= self.interceptorNum:
+                break
             status_code = float(_encode_status(interceptor.status))
             owner = float(interceptor.owner)
             self.observation_interceptors[idx] = np.array(
@@ -313,7 +319,8 @@ class ManeuverEnv:
     def _prepare_lock_only(self, plane_id: int, target_id: int):
         for idx in self.interceptor_pools.get(plane_id, []):
             interceptor = self.interceptorList[idx]
-            interceptor.T_i = target_id
+            if interceptor.attacking == -1:
+                interceptor.T_i = target_id
 
     def _allocate_interceptor(self, plane_id: int) -> Optional[int]:
         ready_pool = self.interceptor_pools.get(plane_id, [])
