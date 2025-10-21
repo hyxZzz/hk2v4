@@ -3,7 +3,11 @@ from typing import List
 
 import numpy as np
 import matplotlib.pyplot as plt
+import copy
+from typing import List, Tuple
+
 import matplotlib as mpl
+import numpy as np
 import torch
 from matplotlib import animation
 
@@ -21,12 +25,12 @@ def squeezeState(NormalState):
     return NormalState.flatten()
 
 
-def resize_flattenState(flattenState, rows=None):
+def resize_flattenState(flattenState, rows=None, cols=8):
     if rows is None:
-        if flattenState.size % 6 != 0:
-            raise ValueError("flattenState length is not divisible by 6; please provide 'rows' explicitly")
-        rows = flattenState.size // 6
-    return np.resize(flattenState, (rows, 6))
+        if flattenState.size % cols != 0:
+            raise ValueError("flattenState length is not divisible by the expected column size")
+        rows = flattenState.size // cols
+    return np.resize(flattenState, (rows, cols))
 
 
 def calTreatFromState(apos, mpos, v_a, v_m):
@@ -36,8 +40,9 @@ def calTreatFromState(apos, mpos, v_a, v_m):
 LEARNING_RATE = 5e-4
 MAXSTEP = 3500
 GAMMA = 0.993
-DEFAULT_NUM_MISSILES = 3
-DEFAULT_INTERCEPTOR_NUM = 8
+DEFAULT_NUM_MISSILES = 4
+DEFAULT_INTERCEPTOR_NUM = 12
+DEFAULT_NUM_PLANES = 2
 
 
 # 预测函数，输入模型的保存地址，进行一次预测，返回一次游戏的state序列
@@ -48,6 +53,7 @@ def predictResult(model_path):
         num_missiles=DEFAULT_NUM_MISSILES,
         StepNum=3500,
         interceptor_num=DEFAULT_INTERCEPTOR_NUM,
+        num_planes=DEFAULT_NUM_PLANES,
     )
     num_missiles = Env.missileNum
     escapeFlag = -1
@@ -55,7 +61,7 @@ def predictResult(model_path):
     state_size = Env._getNewStateSpace()[0]
     action_size = Env._get_actSpace()
     # # 生成智能体
-    model = Double_DQN(state_size=state_size, action_size=action_size)
+    model = Double_DQN(state_size=state_size, action_size_each=action_size, num_agents=Env.num_planes)
 
     state_dic = torch.load(model_path, map_location='cuda:0')
     new_state = {}
@@ -66,11 +72,19 @@ def predictResult(model_path):
 
     model.load_state_dict(new_state)
 
-    agent = MyDQNAgent(model, action_size, gamma=GAMMA, lr=LEARNING_RATE, e_greed=0.1, e_greed_decrement=1e-6)
+    agent = MyDQNAgent(
+        model,
+        action_size,
+        num_agents=Env.num_planes,
+        gamma=GAMMA,
+        lr=LEARNING_RATE,
+        e_greed=0.1,
+        e_greed_decrement=1e-6,
+    )
 
     state = np.zeros((MAXSTEP + 1, state_size), dtype=np.float32)
     obs_rows = Env._get_obs().shape[0]
-    statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 6), dtype=np.float32)
+    statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 8), dtype=np.float32)
     Treat_value = np.zeros((MAXSTEP,), dtype=np.float32)
     state[0], escapeFlag, info = Env.reset()
     state_copy = [state[0], escapeFlag, info]
@@ -95,22 +109,19 @@ def predictResult(model_path):
         #     act = 61
 
         next_state, reward, escapeFlag, info = Env.step(act)
-        # 获取环境中飞机的速度
-        v_a = Env.aircraftList.V
-        apos = [Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z]
-        for j in range(num_missiles):
-            # 计算威胁度：这里的威胁度将已失效的导弹减去
-            if Env.missileList[j].attacking:
-                v_m = Env.missileList[j].V
-                mpos = [Env.missileList[j].X, Env.missileList[j].Y, Env.missileList[j].Z]
-                T = calTreatFromState(apos, mpos, v_a, v_m)
-                if T > 100 or T < 0:
-                    print(T)
-                if Treat < calTreatFromState(apos, mpos, v_a, v_m):
-                    Treat_value[i] = calTreatFromState(apos, mpos, v_a, v_m)
-                if Treat_value[i] > 100 or Treat_value[i] < 0:
-                    print(Treat_value[i])
-                # print(Treat_value[i])
+        max_treat = 0.0
+        for plane in Env.aircraftList:
+            v_a = plane.V
+            apos = [plane.X, plane.Y, plane.Z]
+            for j in range(num_missiles):
+                if Env.missileList[j].attacking:
+                    v_m = Env.missileList[j].V
+                    mpos = [Env.missileList[j].X, Env.missileList[j].Y, Env.missileList[j].Z]
+                    T = calTreatFromState(apos, mpos, v_a, v_m)
+                    max_treat = max(max_treat, T)
+        Treat_value[i] = max_treat
+        if Treat_value[i] > 100 or Treat_value[i] < 0:
+            print(Treat_value[i])
         EvaResult = intervalEvaluation(Treat_value[i])
         # print(Treat_value[i], EvaResult)
         # 记录下一个时刻状态
@@ -137,7 +148,7 @@ def ComparepredictResult(Env: ManeuverEnv, state_copy: List):
     escapeFlag = -1
     state = np.zeros((MAXSTEP + 1, state_size), dtype=np.float32)
     obs_rows = Env._get_obs().shape[0]
-    statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 6), dtype=np.float32)
+    statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 8), dtype=np.float32)
     Treat_value = np.zeros((MAXSTEP,), dtype=np.float32)
     state[0], escapeFlag, info = state_copy
     statefromEnv[0] = Env._get_obs()
@@ -147,24 +158,18 @@ def ComparepredictResult(Env: ManeuverEnv, state_copy: List):
     Treat = 0
     # 循环
     for i in range(MAXSTEP):
-        # 通过智能体模型选动作
-        act = 0
-        # act = 2
-        # 与环境交互
-        next_state, reward, escapeFlag, info = Env.compareTest(act)
-        # print(act)
-        # 获取环境中飞机的速度
-        v_a = Env.aircraftList.V
-        apos = [Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z]
-        for j in range(Env.missileNum):
-            # 计算威胁度：这里的威胁度将已失效的导弹减去
-            if Env.missileList[j].attacking:
-                v_m = Env.missileList[j].V
-                mpos = [Env.missileList[j].X, Env.missileList[j].Y, Env.missileList[j].Z]
-                if Treat < calTreatFromState(apos, mpos, v_a, v_m):
-                    Treat_value[i] = calTreatFromState(apos, mpos, v_a, v_m)
-                if Treat_value[i] > 100 or Treat_value[i] < 0:
-                    print(Treat_value[i])
+        random_actions = tuple(np.random.randint(Env._get_actSpace()) for _ in range(Env.num_planes))
+        next_state, reward, escapeFlag, info = Env.step(random_actions)
+        max_treat = 0.0
+        for plane in Env.aircraftList:
+            v_a = plane.V
+            apos = [plane.X, plane.Y, plane.Z]
+            for j in range(Env.missileNum):
+                if Env.missileList[j].attacking:
+                    v_m = Env.missileList[j].V
+                    mpos = [Env.missileList[j].X, Env.missileList[j].Y, Env.missileList[j].Z]
+                    max_treat = max(max_treat, calTreatFromState(apos, mpos, v_a, v_m))
+        Treat_value[i] = max_treat
         # 记录下一个时刻状态
         # 拉长向量
         statefromEnv[i + 1] = Env._get_obs()
@@ -215,10 +220,17 @@ def showPredictProgress(t, Multistate, axList):
     ax2 = axList[1]
     maxstep = t
     missileNum = DEFAULT_NUM_MISSILES
-    planeState = state[:, 0, 0:3]
-    missileState = state[:, 1:missileNum + 1, 0:3]
-    interceptorState = state[:, missileNum + 1:, 0:3]
-    ax1.plot(planeState[0:maxstep, 0], planeState[0:maxstep, 2], planeState[0:maxstep, 1], linewidth=4, c='b')
+    planeState = state[:, 0:DEFAULT_NUM_PLANES, 0:3]
+    missileState = state[:, DEFAULT_NUM_PLANES:DEFAULT_NUM_PLANES + missileNum, 0:3]
+    interceptorState = state[:, DEFAULT_NUM_PLANES + missileNum:, 0:3]
+    for plane_idx in range(DEFAULT_NUM_PLANES):
+        ax1.plot(
+            planeState[0:maxstep, plane_idx, 0],
+            planeState[0:maxstep, plane_idx, 2],
+            planeState[0:maxstep, plane_idx, 1],
+            linewidth=4,
+            c='b',
+        )
     for i in range(missileNum):
         ax1.plot(missileState[0:maxstep, i, 0], missileState[0:maxstep, i, 2], missileState[0:maxstep, i, 1],
                  linewidth=2, c='r')
