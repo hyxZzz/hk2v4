@@ -35,20 +35,25 @@ def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATC
     step = 0
     while True:
         step += 1
-        # 智能体抽样动作
         action = agent.sample(state)
-        next_state, reward, done, _ = env.step(action)
-        # print(f"reward:{reward}\n")
-        # print(reward)
-        rpmemory.add((state, action, reward, next_state, done))
+        next_state, reward, done, info = env.step(action)
+        attribution = info.get("attribution_bonus")
+        if attribution is None:
+            attribution = np.zeros(Env.num_planes, dtype=np.float32)
+        rpmemory.add((state, action, reward, next_state, done, attribution))
 
         # 当经验回放数组中的经验数量足够多时（大于给定阈值，手动设定），每50个时间步训练一次
         if (rpmemory.size() > MEMORY_WARMUP_SIZE) and (step % LEARN_FREQ == 0):
-            # s,a,r,s',done
             experiences = rpmemory.sample(BATCH_SIZE)
-            batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
-            # 智能体更新价值网络
-            train_loss = agent.learn(batch_state, batch_action, batch_reward, batch_next_state, batch_done)
+            batch_state, batch_action, batch_reward, batch_next_state, batch_done, batch_attr = zip(*experiences)
+            train_loss = agent.learn(
+                batch_state,
+                batch_action,
+                batch_reward,
+                batch_next_state,
+                batch_done,
+                batch_attr,
+            )
 
         total_reward += reward
         state = next_state
@@ -155,11 +160,13 @@ def main():
 
     start = time.time()
 
-    num_missiles = 3
+    num_missiles = 4
     step_num = 3500
     Env, aircraft, missiles = init_env(
         num_missiles=num_missiles,
         StepNum=step_num,
+        interceptor_num=12,
+        num_planes=2,
     )
 
     action_size = Env._get_actSpace()
@@ -171,11 +178,12 @@ def main():
     rpm = MyMemoryBuffer(MEMORY_SIZE)
 
     # 生成智能体
-    model = Double_DQN(state_size=state_size, action_size=action_size)
+    model = Double_DQN(state_size=state_size, action_size_each=action_size, num_agents=Env.num_planes)
 
     agent = MyDQNAgent(
         model,
         action_size,
+        num_agents=Env.num_planes,
         gamma=GAMMA,
         lr=LEARNING_RATE,
         e_greed=0.85,
