@@ -38,10 +38,10 @@ class TerminationStatus(Enum):
 class RewardWeights:
     height: float = 0.6
     distance: float = 0.8
-    interceptor_usage: float = 0.4
-    treat: float = 0.4
-    intercept_quality: float = 0.5
-    sparse: float = 0.75
+    interceptor_usage: float = 0.7
+    treat: float = 0.6
+    intercept_quality: float = 0.8
+    sparse: float = 0.5
 
 
 class ManeuverEnv:
@@ -62,13 +62,13 @@ class ManeuverEnv:
         InterceptorNum: int = 8,
         InterceptorSpeed: float = 540.0,
         curiosity_scale: float = 0.5,
-        punish_penalty: float = 1.0,
+        punish_penalty: float = 0.4,
         launch_gap: int = LanchGap,
         reward_weights: RewardWeights | None = None,
     ) -> None:
         self.reward_weights = reward_weights or RewardWeights()
         self.curiosity_scale = curiosity_scale
-        self.punish_penalty = punish_penalty
+        self.punish_penalty = max(0.0, float(punish_penalty))
         self.launch_gap = max(1, int(launch_gap))
 
         self.escapeFlag: TerminationStatus = TerminationStatus.RUNNING
@@ -129,7 +129,7 @@ class ManeuverEnv:
                 [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z],
             )
         self.t = 0
-        self.lanchTime = 0
+        self.lanchTime = -self.launch_gap
 
     """飞机动作库，11种机动动作，利用三个控制量来控制。
 
@@ -272,6 +272,46 @@ class ManeuverEnv:
         obs = np.concatenate((self.observation_planes, self.observation_missiles, self.observation_interceptors))
         return obs
 
+    def _normalise_obs(self, obs: np.ndarray) -> np.ndarray:
+        obs = obs.astype(np.float32, copy=True)
+        obs[:, 0:3] = obs[:, 0:3] / max(self.position_scale, 1.0)
+        obs[:, 3:6] = obs[:, 3:6] / m.pi
+        return obs
+
+    def _encode_auxiliary_features(self) -> np.ndarray:
+        remain_ratio = self.interceptor_remain / max(1, self.interceptorNum)
+        cooldown_steps = max(0, self.launch_gap - (self.t - self.lanchTime))
+        cooldown_ratio = cooldown_steps / max(1, self.launch_gap)
+        closest_dist, threat_index = self.getClosetMissileDist()
+        closest_norm = np.clip(closest_dist / max(self.position_scale, 1.0), 0.0, 1.0)
+        missile_active = np.array([1.0 if missile.attacking else 0.0 for missile in self.missileList], dtype=np.float32)
+        interceptor_status = np.array(
+            [
+                1.0 if interceptor.attacking == 1 else (-1.0 if interceptor.attacking == -1 else 0.0)
+                for interceptor in self.interceptorList
+            ],
+            dtype=np.float32,
+        )
+        threat_one_hot = np.zeros((self.missileNum,), dtype=np.float32)
+        if missile_active.any():
+            threat_one_hot[int(np.clip(threat_index, 0, self.missileNum - 1))] = 1.0
+        launch_ready = 1.0 if (self.t - self.lanchTime) >= self.launch_gap else 0.0
+
+        aux = np.concatenate(
+            (
+                np.array([remain_ratio, cooldown_ratio, closest_norm, launch_ready], dtype=np.float32),
+                missile_active,
+                interceptor_status,
+                threat_one_hot,
+            )
+        )
+        return aux
+
+    def _build_state_vector(self) -> np.ndarray:
+        core = self._normalise_obs(self._get_obs()).flatten()
+        aux = self._encode_auxiliary_features()
+        return np.concatenate((core, aux)).astype(np.float32)
+
     def _get_actSpace(self):
         a = self.action_space.n
         return a
@@ -383,7 +423,7 @@ class ManeuverEnv:
         成型奖励值
     """
 
-    def commonReward(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> float:
+    def commonReward(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> tuple[float, dict]:
         plane_state = state[0]
         missile_state = state[1 : self.missileNum + 1]
 
@@ -405,13 +445,13 @@ class ManeuverEnv:
 
         interceptor_component = 0.0
         if actual_goal == threat_index and actual_goal != -1:
-            interceptor_component = 1.0
+            interceptor_component = 1.5
         elif actual_goal == -1 and danger_flag:
-            interceptor_component = -1.0
+            interceptor_component = -0.5
         elif actual_goal not in (-1, threat_index):
-            interceptor_component = -0.6
+            interceptor_component = -0.4
         elif desired_goal != actual_goal and desired_goal >= 0:
-            interceptor_component = -0.3
+            interceptor_component = -0.2
 
         quality_component = 0.0
         engaged_count = 0
@@ -423,9 +463,18 @@ class ManeuverEnv:
             if interceptor.T_i == threat_index:
                 aligned_count += 1
         if engaged_count > 0:
-            quality_component = np.clip(2.0 * aligned_count / engaged_count - 1.0, -1.0, 1.0)
+            alignment_ratio = aligned_count / max(engaged_count, 1)
+            quality_component = np.clip(2.0 * alignment_ratio - 0.5, -1.0, 1.0)
 
-        reward = (
+        components = {
+            'component_height': float(height_component),
+            'component_distance': float(distance_component),
+            'component_treat': float(treat_component),
+            'component_interceptor_usage': float(interceptor_component),
+            'component_intercept_quality': float(quality_component),
+        }
+
+        shaped_raw = (
             self.reward_weights.height * height_component
             + self.reward_weights.distance * distance_component
             + self.reward_weights.treat * treat_component
@@ -433,7 +482,13 @@ class ManeuverEnv:
             + self.reward_weights.intercept_quality * quality_component
         )
 
-        return float(np.clip(reward, -4.0, 4.0))
+        shaped_clipped = float(np.clip(shaped_raw, -4.0, 4.0))
+
+        details = dict(components)
+        details['reward_shaped_raw'] = float(shaped_raw)
+        details['reward_shaped_clipped'] = shaped_clipped
+
+        return shaped_clipped, details
     """
         机动不合规惩罚
     """
@@ -450,15 +505,19 @@ class ManeuverEnv:
         status = self.escapeFlag
 
         if status is TerminationStatus.RUNNING:
+            remaining = self.getRemainMissileNum()
+            if remaining == 0:
+                return 0.2 * base
             dist, _ = self.getClosetMissileDist()
-            danger_multiplier = 1.0 if dist <= DANGER_DISTANCE else 0.5
-            return -0.05 * base * danger_multiplier * self.getRemainMissileNum()
+            danger_ratio = np.clip(dist / max(DANGER_DISTANCE, 1.0), 0.0, 2.0)
+            penalty_scale = 2.0 - danger_ratio
+            return -0.02 * base * penalty_scale * remaining
         if status in (TerminationStatus.FAIL_MISSILE_HIT, TerminationStatus.FAIL_CRASH):
-            return -base
+            return -1.5 * base
         if status in (TerminationStatus.MANEUVER_SUCCESS, TerminationStatus.INTERCEPT_SUCCESS):
-            return base
+            return 2.0 * base
         if status is TerminationStatus.TIMEOUT:
-            return -0.2 * base
+            return -0.5 * base
         return 0.0
 
     """
@@ -470,11 +529,19 @@ class ManeuverEnv:
             奖励值Reward
         """
 
-    def rewards(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> float:
-        shaped = self.commonReward(state, actual_goal, desired_goal)
-        sparse = self.SparseReward()
-        total = shaped + sparse
-        return float(np.clip(total, -5.0, 5.0))
+    def rewards(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> tuple[float, dict]:
+        shaped_clipped, details = self.commonReward(state, actual_goal, desired_goal)
+        shaped_raw = details['reward_shaped_raw']
+        sparse = float(self.SparseReward())
+        total_before_clip = shaped_raw + sparse
+        total_clipped = float(np.clip(total_before_clip, -5.0, 5.0))
+
+        reward_info = dict(details)
+        reward_info['reward_sparse'] = sparse
+        reward_info['reward_total_before_clip'] = float(total_before_clip)
+        reward_info['reward_total_clipped'] = total_clipped
+
+        return total_clipped, reward_info
 
     '''获取剩余导弹个数'''
     def getRemainMissileNum(self):
@@ -514,6 +581,8 @@ class ManeuverEnv:
             self.At_1 = action
 
         control, actual_goal, desired_goal = self.getActionData(action)
+        actual_goal = -1 if actual_goal is None else int(actual_goal)
+        desired_goal = -1 if desired_goal is None else int(desired_goal)
         nx, ny, roll, pitch_constraint = control
 
         launch_allowed = not (self.interceptor_remain == 0 and actual_goal != -1)
@@ -524,31 +593,59 @@ class ManeuverEnv:
         )
 
         speed_flag = True
-        info = {}
+        info: dict = {}
+        penalty = 0.0
         if valid_action:
             for _ in range(Gostep):
                 state, _, info = self.generate_obs(control)
                 if self.escapeFlag is not TerminationStatus.RUNNING:
                     break
-            reward = self.rewards(state, actual_goal, desired_goal)
+            reward, reward_info = self.rewards(state, actual_goal, desired_goal)
         else:
             for _ in range(Gostep):
                 state, _, info = self.constraint_obs(control, speed_flag)
                 if self.escapeFlag is not TerminationStatus.RUNNING:
                     break
-            reward = self.rewards(state, actual_goal, desired_goal) + self.Punish()
+            reward, reward_info = self.rewards(state, actual_goal, desired_goal)
+            penalty = float(self.Punish())
+            reward += penalty
             info = {**info, 'constraint_violation': True}
 
         if valid_action:
             info = {**info, 'constraint_violation': False}
 
+        curiosity_bonus = 0.0
         if action != self.At_1:
-            reward += self.curiosity_scale
+            curiosity_bonus = float(self.curiosity_scale)
+            reward += curiosity_bonus
+
+        closest_dist, threat_index = self.getClosetMissileDist()
+        launch_ready = 1.0 if (self.t - self.lanchTime) >= self.launch_gap else 0.0
+
+        reward_info = dict(reward_info)
+        reward_info['constraint_penalty'] = penalty
+        reward_info['curiosity_bonus'] = curiosity_bonus
+        reward_info['reward_after_adjustments'] = float(reward)
+        reward_info['launch_ready'] = float(launch_ready)
+        reward_info['launch_allowed'] = bool(launch_allowed)
+        reward_info['interceptor_remain'] = float(self.interceptor_remain)
+        reward_info['closest_missile_distance'] = float(closest_dist)
+        reward_info['threat_index'] = int(threat_index)
+        reward_info['actual_goal'] = actual_goal
+        reward_info['desired_goal'] = desired_goal
+        reward_info['launch_attempted'] = 1.0 if desired_goal != -1 else 0.0
+        reward_info['launch_successful'] = 1.0 if actual_goal != -1 else 0.0
+        reward_info['correct_target'] = (
+            1.0 if (actual_goal == threat_index and actual_goal != -1) else 0.0
+        )
+        reward_info['step_termination'] = self.escapeFlag.value
+
+        info = {**info, **reward_info}
 
         self.t += 1
         self.At_1 = action
 
-        observation = self._genNewState_()
+        observation = self._build_state_vector()
         return observation, reward, self.escapeFlag.value, info
 
 
@@ -562,33 +659,63 @@ class ManeuverEnv:
         forced_goal = 0 if self.t % 2 == 0 else 1
         maneuver_idx, _ = self.decode_action(action)
         control, actual_goal = self.AirCraftActions(maneuver_idx, forced_goal)
+        actual_goal = -1 if actual_goal is None else int(actual_goal)
+        forced_goal = -1 if forced_goal is None else int(forced_goal)
 
         nx, ny, roll, pitch_constraint = control
         launch_allowed = not (self.interceptor_remain == 0 and actual_goal != -1)
         speed_flag = True
 
+        penalty = 0.0
         if self.aircraftList.action_constraint(pitch_constraint) and self.aircraftList.speed_constraint(nx) and launch_allowed:
             for _ in range(Gostep):
                 state, _, info = self.generate_obs(control)
                 if self.escapeFlag is not TerminationStatus.RUNNING:
                     break
-            reward = self.rewards(state, actual_goal, forced_goal)
+            reward, reward_info = self.rewards(state, actual_goal, forced_goal)
             info = {**info, 'constraint_violation': False}
         else:
             for _ in range(Gostep):
                 state, _, info = self.constraint_obs(control, speed_flag)
                 if self.escapeFlag is not TerminationStatus.RUNNING:
                     break
-            reward = self.rewards(state, actual_goal, forced_goal) + self.Punish()
+            reward, reward_info = self.rewards(state, actual_goal, forced_goal)
+            penalty = float(self.Punish())
+            reward += penalty
             info = {**info, 'constraint_violation': True}
 
+        curiosity_bonus = 0.0
         if action != self.At_1:
-            reward += self.curiosity_scale
+            curiosity_bonus = float(self.curiosity_scale)
+            reward += curiosity_bonus
+
+        closest_dist, threat_index = self.getClosetMissileDist()
+        launch_ready = 1.0 if (self.t - self.lanchTime) >= self.launch_gap else 0.0
+
+        reward_info = dict(reward_info)
+        reward_info['constraint_penalty'] = penalty
+        reward_info['curiosity_bonus'] = curiosity_bonus
+        reward_info['reward_after_adjustments'] = float(reward)
+        reward_info['launch_ready'] = float(launch_ready)
+        reward_info['launch_allowed'] = bool(launch_allowed)
+        reward_info['interceptor_remain'] = float(self.interceptor_remain)
+        reward_info['closest_missile_distance'] = float(closest_dist)
+        reward_info['threat_index'] = int(threat_index)
+        reward_info['actual_goal'] = actual_goal
+        reward_info['desired_goal'] = forced_goal
+        reward_info['launch_attempted'] = 1.0 if forced_goal != -1 else 0.0
+        reward_info['launch_successful'] = 1.0 if actual_goal != -1 else 0.0
+        reward_info['correct_target'] = (
+            1.0 if (actual_goal == threat_index and actual_goal != -1) else 0.0
+        )
+        reward_info['step_termination'] = self.escapeFlag.value
+
+        info = {**info, **reward_info}
 
         self.t += 1
         self.At_1 = action
 
-        state = self._genNewState_()
+        state = self._build_state_vector()
         return state, reward, self.escapeFlag.value, info
 
     def reset(self):
@@ -645,11 +772,11 @@ class ManeuverEnv:
                 [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z],
             )
         self.t = 0
-        self.lanchTime = 0
+        self.lanchTime = -self.launch_gap
         self.spaceSize = spaceSize
         self.max_steps = max(1, int(spaceSize))
 
-        state = self._genNewState_()
+        state = self._build_state_vector()
         return state, self.escapeFlag.value, self._build_info()
 
     # 无量纲化
@@ -666,8 +793,7 @@ class ManeuverEnv:
 
     """新特征向量的大小"""
     def _getNewStateSpace(self):
-        state = np.zeros((self.missileNum * self.interceptorNum + 2 * self.missileNum + self.interceptorNum,),
-                         dtype=np.float32)
+        state = self._build_state_vector()
         return state.shape
 
 
@@ -701,38 +827,6 @@ class ManeuverEnv:
 
 
 
-    """新特征状态"""
+    """兼容旧接口，直接返回构建后的状态向量"""
     def _genNewState_(self):
-
-        state = np.zeros((self.missileNum * self.interceptorNum + 2 * self.missileNum + self.interceptorNum,), dtype=np.float32)
-        missileDist = np.zeros((self.missileNum, ), dtype=np.float32)
-        interceptorDist = np.zeros((self.missileNum * self.interceptorNum, ), dtype=np.float32)
-        missileStatus = np.zeros((self.missileNum, ), dtype=np.float32)
-        interceptorStatus = np.zeros((self.interceptorNum, ), dtype=np.float32)
-
-        for i in range(self.missileNum):
-            missileDist[i] = CalDistance([self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z], [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z]) / 10000
-
-        t = 0
-        for i in range(self.interceptorNum):
-            for j in range(self.missileNum):
-                interceptorDist[t] = CalDistance([self.interceptorList[i].X_i, self.interceptorList[i].Y_i, self.interceptorList[i].Z_i], [self.missileList[j].X, self.missileList[j].Y, self.missileList[j].Z]) / 10000
-                t += 1
-
-        for i in range(self.missileNum):
-            if self.missileList[i].attacking:
-                missileStatus[i] = 1
-            else:
-                missileStatus[i] = -1
-
-        for i in range(self.interceptorNum):
-            if self.interceptorList[i].attacking == -1:
-                interceptorStatus[i] = -1
-            elif self.interceptorList[i].attacking == 1:
-                interceptorStatus[i] = 1
-
-            else:
-                interceptorStatus[i] = 0
-
-        state = np.concatenate((missileDist, interceptorDist, missileStatus, interceptorStatus))
-        return state
+        return self._build_state_vector()
