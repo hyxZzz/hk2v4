@@ -7,7 +7,7 @@ import math as m
 import numpy as np
 from gym import spaces
 
-from Environment.ActionDepository import getNewActionDepository
+from Environment.ActionDepository import getActionDepository
 from Environment.reset_env import reset_para
 from flat_models.ThreatEvaluate import CalTreat
 from flat_models.trajectory import Aircraft, Interceptor, Missiles
@@ -31,6 +31,12 @@ VELOCITY_SCALE = 1000.0
 TEAM_REWARD_WEIGHTS = dict(intercept=2.0, survival=1.0, safety=0.5)
 ATTRIBUTION_BONUS = 0.1
 DANGER_DISTANCE = 3000.0
+DANGER_HOLD_PENALTY = 0.6
+RESPONSIVE_LAUNCH_BONUS = 0.4
+PREMATURE_LAUNCH_PENALTY = 0.2
+INVALID_TARGET_PENALTY = 0.15
+CONSTRAINT_FAILURE_PENALTY = 0.1
+MAX_PREMATURE_DISTANCE = DANGER_DISTANCE * 3.0
 LanchGap = 70
 
 
@@ -58,8 +64,8 @@ class ManeuverEnv:
         allow_cross_lock: bool = True,
         max_locks_per_missile: int = 2,
     ):
-        self.action_space = spaces.Discrete(act_num)
-        self.action_dep = getNewActionDepository(act_num)
+        self.action_dep = getActionDepository(missilesNum, act_num)
+        self.action_space = spaces.Discrete(len(self.action_dep))
         self.allow_cross_lock = allow_cross_lock
         self.max_locks_per_missile = max_locks_per_missile
 
@@ -85,9 +91,10 @@ class ManeuverEnv:
 
         self.t = 0
         self.escapeFlag = -1
-        self.lanchTime = np.zeros(self.num_planes, dtype=np.int32)
+        self.lanchTime = np.full(self.num_planes, -LanchGap, dtype=np.int32)
         self.team_reward_log: List[float] = []
         self.attribution_bonus = np.zeros(self.num_planes, dtype=np.float32)
+        self._step_metadata: List[Dict[str, object]] = [self._empty_step_meta() for _ in range(self.num_planes)]
 
         self._init_interceptors()
         self._update_observations()
@@ -118,12 +125,16 @@ class ManeuverEnv:
         self.attribution_bonus = np.zeros(self.num_planes, dtype=np.float32)
         self.t = 0
         self.escapeFlag = -1
-        self.lanchTime = np.zeros(self.num_planes, dtype=np.int32)
+        self.lanchTime = np.full(self.num_planes, -LanchGap, dtype=np.int32)
         self.interceptor_remain = self.interceptorNum
 
         self.observation_planes = np.zeros((self.num_planes, PLANE_FEATURE_DIM), dtype=np.float32)
         self.observation_missiles = np.zeros((self.missileNum, MISSILE_FEATURE_DIM), dtype=np.float32)
         self.observation_interceptors = np.zeros((self.interceptorNum, INTERCEPTOR_FEATURE_DIM), dtype=np.float32)
+
+        self.action_dep = getActionDepository(self.missileNum, act_num)
+        self.action_space = spaces.Discrete(len(self.action_dep))
+        self._step_metadata = [self._empty_step_meta() for _ in range(self.num_planes)]
 
         self._init_interceptors()
         self._update_observations()
@@ -243,6 +254,7 @@ class ManeuverEnv:
         self.attribution_bonus = np.zeros(self.num_planes, dtype=np.float32)
         info = {"attribution_bonus": self.attribution_bonus}
         self.escapeFlag = -1
+        self._step_metadata = [self._empty_step_meta() for _ in range(self.num_planes)]
 
         for _ in range(Gostep):
             self._apply_actions(actions)
@@ -260,6 +272,7 @@ class ManeuverEnv:
             "attribution_bonus": self.attribution_bonus.copy(),
             "intercepts_by_owner": self.intercepts_by_owner.copy(),
             "borrowed_usage_count": self.borrowed_usage_count,
+            "action_metadata": [dict(meta) for meta in self._step_metadata],
         }
 
         done_flag = self.escapeFlag
@@ -271,12 +284,47 @@ class ManeuverEnv:
 
     def _apply_actions(self, actions: Sequence[int]):
         for plane_id, action_idx in enumerate(actions):
+            action_idx = int(action_idx)
+            meta = self._step_metadata[plane_id]
+            meta["action_index"] = action_idx
+            meta["launch"] = False
+            meta["constraint_failed"] = False
+            meta["invalid_target"] = False
+            meta["target_distance"] = None
+            meta["nearest_distance"] = self._nearest_active_missile_distance(plane_id)
+            meta["danger_zone"] = (
+                meta["nearest_distance"] is not None and meta["nearest_distance"] < DANGER_DISTANCE
+            )
+
             action = self.action_dep[action_idx]
-            nx, ny, roll, pitch_constraint = action
+            nx, ny, roll, pitch_constraint = action[:4]
+            target_cmd = int(round(action[4])) if action.shape[0] > 4 else -1
+            meta["target"] = target_cmd
+
             aircraft = self.aircraftList[plane_id]
 
-            interceptor_goal = self._select_target_for_plane(plane_id)
-            launch = self._attempt_launch(plane_id, interceptor_goal)
+            launch = False
+            valid_target = 0 <= target_cmd < len(self.missileList) and self.missileList[target_cmd].attacking
+            if valid_target:
+                meta["target_distance"] = CalDistance(
+                    [aircraft.X, aircraft.Y, aircraft.Z],
+                    [
+                        self.missileList[target_cmd].X,
+                        self.missileList[target_cmd].Y,
+                        self.missileList[target_cmd].Z,
+                    ],
+                )
+                launch = self._attempt_launch(plane_id, target_cmd, meta)
+                if not launch:
+                    self._prepare_lock_only(plane_id, target_cmd)
+            else:
+                if target_cmd >= 0:
+                    meta["invalid_target"] = True
+                if (
+                    0 <= target_cmd < len(self.missileList)
+                    and self.missileList[target_cmd].attacking
+                ):
+                    self._prepare_lock_only(plane_id, target_cmd)
 
             if not aircraft.action_constraint(pitch_constraint) or not aircraft.speed_constraint(nx):
                 nx = 0
@@ -284,29 +332,33 @@ class ManeuverEnv:
                 roll = aircraft.roll
 
             aircraft.AircraftPostition(None, nx, ny, roll, pitch_constraint)
-            if not launch and interceptor_goal >= 0:
-                self._prepare_lock_only(plane_id, interceptor_goal)
 
-    def _select_target_for_plane(self, plane_id: int) -> int:
+    def _nearest_active_missile_distance(self, plane_id: int) -> Optional[float]:
         plane = self.aircraftList[plane_id]
-        closest = -1
-        closest_dist = float("inf")
-        for idx, missile in enumerate(self.missileList):
-            if not missile.attacking:
-                continue
-            dist = CalDistance([plane.X, plane.Y, plane.Z], [missile.X, missile.Y, missile.Z])
-            if dist < closest_dist:
-                closest_dist = dist
-                closest = idx
-        return closest
+        distances = [
+            CalDistance([plane.X, plane.Y, plane.Z], [missile.X, missile.Y, missile.Z])
+            for missile in self.missileList
+            if missile.attacking
+        ]
+        if not distances:
+            return None
+        return float(min(distances))
 
-    def _attempt_launch(self, plane_id: int, target_id: int) -> bool:
+    def _attempt_launch(self, plane_id: int, target_id: int, meta: Optional[Dict[str, object]] = None) -> bool:
         if target_id < 0:
             return False
+        if self.t - self.lanchTime[plane_id] < LanchGap:
+            if meta is not None:
+                meta["constraint_failed"] = True
+            return False
         if not self.LockConstraint(target_id):
+            if meta is not None:
+                meta["constraint_failed"] = True
             return False
         allocated = self._allocate_interceptor(plane_id)
         if allocated is None:
+            if meta is not None:
+                meta["constraint_failed"] = True
             return False
         interceptor = self.interceptorList[allocated]
         plane = self.aircraftList[plane_id]
@@ -314,6 +366,9 @@ class ManeuverEnv:
         launch_speed = max(plane.V, self.interceptorSpeed)
         interceptor.begin_pursuit(target_id, launch_speed, plane_id, float(self.t))
         self.lanchTime[plane_id] = self.t
+        if meta is not None:
+            meta["launch"] = True
+            meta["constraint_failed"] = False
         return True
 
     def _prepare_lock_only(self, plane_id: int, target_id: int):
@@ -440,8 +495,39 @@ class ManeuverEnv:
         )
         reward -= 0.3 * threat_penalty
         reward += float(np.sum(self.attribution_bonus))
+        reward += self._launch_shaping_reward()
         self.team_reward_log.append(reward)
         return reward
+
+    def _launch_shaping_reward(self) -> float:
+        shaping_reward = 0.0
+        penalties = 0.0
+        for meta in self._step_metadata:
+            nearest = meta.get("nearest_distance")
+            target_distance = meta.get("target_distance")
+            launch = bool(meta.get("launch"))
+            danger_zone = bool(meta.get("danger_zone"))
+            if danger_zone:
+                if launch and target_distance is not None:
+                    ratio = 1.0 - min(target_distance, DANGER_DISTANCE) / DANGER_DISTANCE
+                    shaping_reward += RESPONSIVE_LAUNCH_BONUS * ratio
+                elif not launch and nearest is not None:
+                    ratio = 1.0 - min(nearest, DANGER_DISTANCE) / DANGER_DISTANCE
+                    penalties += DANGER_HOLD_PENALTY * ratio
+            else:
+                if launch:
+                    far_distance = target_distance if target_distance is not None else nearest
+                    if far_distance is None:
+                        far_distance = MAX_PREMATURE_DISTANCE
+                    excess = max(0.0, far_distance - DANGER_DISTANCE)
+                    penalties += PREMATURE_LAUNCH_PENALTY * min(excess / max(1.0, MAX_PREMATURE_DISTANCE - DANGER_DISTANCE), 1.0)
+
+            if meta.get("invalid_target"):
+                penalties += INVALID_TARGET_PENALTY
+            if meta.get("constraint_failed"):
+                penalties += CONSTRAINT_FAILURE_PENALTY
+
+        return shaping_reward - penalties
 
     def _mean_missile_distance(self) -> float:
         distances = []
@@ -463,7 +549,7 @@ class ManeuverEnv:
             return False
         locked = 0
         for interceptor in self.interceptorList:
-            if interceptor.T_i == missile_id and interceptor.attacking != -1:
+            if interceptor.T_i == missile_id and interceptor.status in ("ready", "in_flight"):
                 locked += 1
         return locked < self.max_locks_per_missile
 
@@ -548,7 +634,7 @@ class ManeuverEnv:
         )
 
     def _get_actSpace(self):
-        return act_num
+        return len(self.action_dep)
 
     def _getNewStateSpace(self):
         state = self._build_global_state()
@@ -559,3 +645,16 @@ class ManeuverEnv:
 
     def render(self):
         pass
+
+    def _empty_step_meta(self) -> Dict[str, object]:
+        return {
+            "action_index": -1,
+            "target": -1,
+            "launch": False,
+            "constraint_failed": False,
+            "invalid_target": False,
+            "target_distance": None,
+            "nearest_distance": None,
+            "danger_zone": False,
+        }
+
