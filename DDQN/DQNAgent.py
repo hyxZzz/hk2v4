@@ -139,8 +139,10 @@ class MyDQNAgent:
         # 梯度更新
         self.optimizer.step()
 
+        loss_value = float(loss.item())
+
         self.global_step += 1
         if self.global_step % self.update_target_steps == 0:
             self._update_target_model()
 
-        return loss
+        return loss_value

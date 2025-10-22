@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
 import argparse
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -7,6 +10,7 @@ import torch
 from DDQN.DDQN import Double_DQN
 from DDQN.DQNAgent import MyDQNAgent
 from utils.ERbuffer import MyMemoryBuffer
+from Environment.env import TerminationStatus
 from Environment.init_env import init_env
 from tensorboardX import SummaryWriter
 
@@ -27,17 +31,60 @@ from utils.validate import (
 writer = SummaryWriter('./models/DQNmodels/DDQNmodels3_23/runs/train_process3_21')
 
 
+DIAGNOSTIC_SUM_KEYS = (
+    'reward_shaped_raw',
+    'reward_shaped_clipped',
+    'reward_sparse',
+    'reward_total_before_clip',
+    'reward_total_clipped',
+    'reward_after_adjustments',
+    'component_height',
+    'component_distance',
+    'component_treat',
+    'component_interceptor_usage',
+    'component_intercept_quality',
+    'constraint_penalty',
+    'curiosity_bonus',
+    'launch_ready',
+    'closest_missile_distance',
+    'interceptor_remain',
+)
+
+
+def summarize_diagnostics(episodes: list[dict]) -> dict | None:
+    if not episodes:
+        return None
+
+    summary: dict[str, float] = {}
+    numeric_keys = [key for key in episodes[0].keys() if key != 'terminal_status']
+
+    for key in numeric_keys:
+        summary[key] = float(np.mean([episode.get(key, 0.0) for episode in episodes]))
+
+    summary['episodes'] = len(episodes)
+    terminal_counts = Counter(episode.get('terminal_status', -1) for episode in episodes)
+    summary['terminal_status_counts'] = dict(terminal_counts)
+
+    return summary
+
+
 # 启用环境进行训练，done=1则结束该次训练，返回奖励值
 def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE):
     total_reward = 0.0
     train_loss = 0.0
-    state, escapeFlag, info = env.reset()
+    state, _, _ = env.reset()
     step = 0
+    info_sums = defaultdict(float)
+    constraint_violations = 0
+    launch_attempts = 0.0
+    launch_successes = 0.0
+    correct_targets = 0.0
+    terminal_status = TerminationStatus.RUNNING.value
     while True:
         step += 1
         # 智能体抽样动作
         action = agent.sample(state)
-        next_state, reward, done, _ = env.step(action)
+        next_state, reward, done, step_info = env.step(action)
         # print(f"reward:{reward}\n")
         # print(reward)
         rpmemory.add((state, action, reward, next_state, done))
@@ -51,10 +98,63 @@ def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATC
             train_loss = agent.learn(batch_state, batch_action, batch_reward, batch_next_state, batch_done)
 
         total_reward += reward
+
+        if isinstance(step_info, dict):
+            for key in DIAGNOSTIC_SUM_KEYS:
+                if key in step_info:
+                    info_sums[key] += float(step_info[key])
+            if step_info.get('constraint_violation'):
+                constraint_violations += 1
+            launch_attempts += float(step_info.get('launch_attempted', 0.0))
+            launch_successes += float(step_info.get('launch_successful', 0.0))
+            correct_targets += float(step_info.get('correct_target', 0.0))
+
         state = next_state
         if done != -1:
+            terminal_status = int(done)
             break
-    return total_reward, train_loss
+
+    steps = step
+
+    def average_info(key: str) -> float:
+        if steps <= 0:
+            return 0.0
+        return info_sums[key] / steps
+
+    launch_attempt_rate = (launch_attempts / steps) if steps > 0 else 0.0
+    launch_success_rate = (launch_successes / launch_attempts) if launch_attempts > 0 else 0.0
+    correct_target_rate = (correct_targets / launch_attempts) if launch_attempts > 0 else 0.0
+
+    episode_summary = {
+        'steps': steps,
+        'avg_reward_final': (total_reward / steps) if steps > 0 else 0.0,
+        'avg_reward_shaped_raw': average_info('reward_shaped_raw'),
+        'avg_reward_shaped_clipped': average_info('reward_shaped_clipped'),
+        'avg_reward_sparse': average_info('reward_sparse'),
+        'avg_reward_total_before_clip': average_info('reward_total_before_clip'),
+        'avg_reward_total_clipped': average_info('reward_total_clipped'),
+        'avg_reward_after_adjustments': average_info('reward_after_adjustments'),
+        'avg_component_height': average_info('component_height'),
+        'avg_component_distance': average_info('component_distance'),
+        'avg_component_treat': average_info('component_treat'),
+        'avg_component_interceptor_usage': average_info('component_interceptor_usage'),
+        'avg_component_intercept_quality': average_info('component_intercept_quality'),
+        'avg_constraint_penalty': average_info('constraint_penalty'),
+        'avg_curiosity_bonus': average_info('curiosity_bonus'),
+        'mean_launch_ready': average_info('launch_ready'),
+        'mean_closest_missile_distance': average_info('closest_missile_distance'),
+        'mean_interceptor_remain': average_info('interceptor_remain'),
+        'constraint_violation_rate': (constraint_violations / steps) if steps > 0 else 0.0,
+        'launch_attempt_rate': launch_attempt_rate,
+        'launch_success_rate': launch_success_rate,
+        'launch_success_per_step': (launch_successes / steps) if steps > 0 else 0.0,
+        'correct_target_rate': correct_target_rate,
+        'correct_target_per_step': (correct_targets / steps) if steps > 0 else 0.0,
+        'interceptor_remaining_final': float(env.interceptor_remain),
+        'terminal_status': terminal_status,
+    }
+
+    return total_reward, train_loss, episode_summary
 
 
 # 评估若干回合，返回奖励与成功率统计
@@ -198,6 +298,7 @@ def main():
     validation_csv_path = None
 
     train_loss = 0.0
+    recent_episode_summaries: list[dict] = []
 
     # start training
     start_time = time.time()
@@ -209,12 +310,64 @@ def main():
     while episode < max_episode:
         episodes_to_run = min(eval_interval, max_episode - episode)
         for _ in range(episodes_to_run):
-            total_reward, train_loss = run_train_episode(agent, Env, rpm, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE)
+            (
+                total_reward,
+                train_loss,
+                episode_summary,
+            ) = run_train_episode(agent, Env, rpm, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE)
             episode += 1
             writer.add_scalar('train/loss', train_loss, episode)
             writer.add_scalar('train/episode_reward', total_reward, episode)
+            writer.add_scalar('diagnostics/avg_reward_shaped_raw', episode_summary['avg_reward_shaped_raw'], episode)
+            writer.add_scalar('diagnostics/avg_reward_sparse', episode_summary['avg_reward_sparse'], episode)
+            writer.add_scalar('diagnostics/constraint_violation_rate', episode_summary['constraint_violation_rate'], episode)
+            writer.add_scalar('diagnostics/launch_attempt_rate', episode_summary['launch_attempt_rate'], episode)
+            writer.add_scalar('diagnostics/launch_success_rate', episode_summary['launch_success_rate'], episode)
+            writer.add_scalar('diagnostics/correct_target_rate', episode_summary['correct_target_rate'], episode)
+            writer.add_scalar('diagnostics/mean_closest_missile_distance', episode_summary['mean_closest_missile_distance'], episode)
+
+            recent_episode_summaries.append(episode_summary)
 
         if (episode % eval_interval == 0) or (episode == max_episode):
+            diag_summary = summarize_diagnostics(recent_episode_summaries)
+            if diag_summary:
+                episodes_count = int(diag_summary.get('episodes', 0))
+                print(
+                    '    Diagnostics ({} eps): shaped_raw:{:.3f} sparse:{:.3f} penalty:{:.3f} final_avg:{:.3f} '
+                    'constraint:{:.2%} launch_attempt:{:.2%} launch_success:{:.2%} correct_target:{:.2%} '
+                    'closest_dist:{:.1f}'.format(
+                        episodes_count,
+                        diag_summary.get('avg_reward_shaped_raw', 0.0),
+                        diag_summary.get('avg_reward_sparse', 0.0),
+                        diag_summary.get('avg_constraint_penalty', 0.0),
+                        diag_summary.get('avg_reward_final', 0.0),
+                        diag_summary.get('constraint_violation_rate', 0.0),
+                        diag_summary.get('launch_attempt_rate', 0.0),
+                        diag_summary.get('launch_success_rate', 0.0),
+                        diag_summary.get('correct_target_rate', 0.0),
+                        diag_summary.get('mean_closest_missile_distance', 0.0),
+                    )
+                )
+                print(
+                    '    Interceptor remain avg:{:.2f} final:{:.2f} curiosity:{:.3f}'.format(
+                        diag_summary.get('mean_interceptor_remain', 0.0),
+                        diag_summary.get('interceptor_remaining_final', 0.0),
+                        diag_summary.get('avg_curiosity_bonus', 0.0),
+                    )
+                )
+                status_counts = diag_summary.get('terminal_status_counts', {})
+                if status_counts:
+                    readable = []
+                    for code, count in sorted(status_counts.items()):
+                        if code in TerminationStatus._value2member_map_:
+                            name = TerminationStatus(code).name
+                        else:
+                            name = str(code)
+                        readable.append(f'{name}:{int(count)}')
+                    print('    Terminal distribution: ' + ', '.join(readable))
+
+            recent_episode_summaries.clear()
+
             eval_metrics = evaluate_agent(agent, Env, eval_episodes=args.validation_episodes, render=False)
             writer.add_scalar('eval/mean_total_reward', eval_metrics.mean_total_reward, episode)
             writer.add_scalar('eval/mean_reward_per_step', eval_metrics.mean_reward_per_step, episode)
