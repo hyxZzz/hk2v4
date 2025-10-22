@@ -29,8 +29,8 @@ writer = SummaryWriter('./models/DQNmodels/DDQNmodels3_23/runs/train_process3_21
 
 # 启用环境进行训练，done=1则结束该次训练，返回奖励值
 def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE):
-    total_reward = 0
-    train_loss = 1e8
+    total_reward = 0.0
+    train_loss = 0.0
     state, escapeFlag, info = env.reset()
     step = 0
     while True:
@@ -43,7 +43,7 @@ def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATC
         rpmemory.add((state, action, reward, next_state, done))
 
         # 当经验回放数组中的经验数量足够多时（大于给定阈值，手动设定），每50个时间步训练一次
-        if (rpmemory.size() > MEMORY_WARMUP_SIZE) and (step % LEARN_FREQ == 0):
+        if (rpmemory.size() >= MEMORY_WARMUP_SIZE) and (step % LEARN_FREQ == 0):
             # s,a,r,s',done
             experiences = rpmemory.sample(BATCH_SIZE)
             batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
@@ -126,16 +126,16 @@ def main():
     parser.add_argument('--memory_size', type=int, default=60000, help='Size of replay memory')
     parser.add_argument('--memory_warmup_size', type=int, default=4000, help='Warmup size of replay memory')
     parser.add_argument('--learn_freq', type=int, default=20, help='Frequency of learning')
-    parser.add_argument('--batch_size', type=int, default=384, help='Batch size for training')
-    parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for training')
-    parser.add_argument('--gamma', type=float, default=0.993, help='Discount factor')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for training')
+    parser.add_argument('--gamma', type=float, default=0.985, help='Discount factor')
     parser.add_argument(
         '--target_update_freq',
         type=int,
-        default=15,
+        default=100,
         help='Number of learning steps between target network updates',
     )
-    parser.add_argument('--max_episode', type=int, default=1000, help='Maximum number of episodes')
+    parser.add_argument('--max_episode', type=int, default=1500, help='Maximum number of episodes')
     parser.add_argument(
         '--validation_episodes',
         type=int,
@@ -181,9 +181,10 @@ def main():
         e_greed=0.85,
         e_greed_decrement=5e-7,
         update_target_steps=TARGET_UPDATE_FREQ,
+        target_update_tau=0.05,
     )
 
-    max_episode = 2000
+    max_episode = args.max_episode
 
     validation_config = EvaluationConfig(
         episodes=args.validation_episodes,
@@ -196,21 +197,24 @@ def main():
     validation_results = []
     validation_csv_path = None
 
-    train_loss = 0
+    train_loss = 0.0
 
     # start training
     start_time = time.time()
     print('start training...')
     episode = 0
-    while episode < max_episode:
-        # train part
-        for i in range(50):
-            total_reward, train_loss = run_train_episode(agent, Env, rpm, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE)
-            writer.add_scalar('train/loss', train_loss, episode)
-            episode += 1
+    eval_interval = 25
+    checkpoint_interval = 100
 
-        # test part
-        if episode % 50 == 0:
+    while episode < max_episode:
+        episodes_to_run = min(eval_interval, max_episode - episode)
+        for _ in range(episodes_to_run):
+            total_reward, train_loss = run_train_episode(agent, Env, rpm, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATCH_SIZE)
+            episode += 1
+            writer.add_scalar('train/loss', train_loss, episode)
+            writer.add_scalar('train/episode_reward', total_reward, episode)
+
+        if (episode % eval_interval == 0) or (episode == max_episode):
             eval_metrics = evaluate_agent(agent, Env, eval_episodes=args.validation_episodes, render=False)
             writer.add_scalar('eval/mean_total_reward', eval_metrics.mean_total_reward, episode)
             writer.add_scalar('eval/mean_reward_per_step', eval_metrics.mean_reward_per_step, episode)
@@ -225,7 +229,7 @@ def main():
                     train_loss,
                 )
             )
-        if episode % 100 == 0:
+        if (episode % checkpoint_interval == 0) or (episode == max_episode):
             ## 保存模型
             checkpoint_path = './models/DQNmodels/DDQNmodels3_23/DDQN_episode{}.pth'.format(episode)
             torch.save({'model': model.state_dict()}, checkpoint_path)
