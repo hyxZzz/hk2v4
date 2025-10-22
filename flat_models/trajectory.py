@@ -583,6 +583,7 @@ class Interceptor:
         boost_duration: float = 5.0,
         speed_decay_interval: float = 1.0,
         speed_decay_factor: float = 0.99,
+        owner: int = 0,
     ):
         self.X_i, self.Y_i, self.Z_i = interceptor_plist  # 拦截弹发射时位于的坐标
         self.V_i = v_i  # 拦截弹发射初速度
@@ -605,6 +606,18 @@ class Interceptor:
         self.time = 0.0
         self._last_decay_time = boost_duration
 
+        # 归属与协同信息
+        self.owner = owner  # 初始携带该拦截弹的飞机编号
+        self.available_to: List[int] = [owner]  # 当前允许调度的飞机编号集合
+        self.current_holder = owner  # 当前持有方（可能因借弹而改变）
+        self.launched_by: Optional[int] = None  # 实际发射的飞机编号
+        self.launch_time: Optional[float] = None
+        self.hit_time: Optional[float] = None
+        self.target_history: List[int] = []  # 记录曾指向的导弹索引
+
+        # 状态标志：ready / in_flight / hit / lost
+        self.status: str = "ready"
+
     def reset_dynamics(self, launch_speed: Optional[float] = None):
         if launch_speed is not None:
             self.initial_speed = launch_speed
@@ -612,10 +625,27 @@ class Interceptor:
         self.time = 0.0
         self._last_decay_time = self.boost_duration
 
-    def begin_pursuit(self, target_index: int, launch_speed: float):
+    def begin_pursuit(self, target_index: int, launch_speed: float, launching_plane: int, current_time: float):
         self.T_i = target_index
         self.attacking = 0
+        self.status = "in_flight"
+        self.current_holder = launching_plane
+        self.launched_by = launching_plane
+        self.launch_time = current_time
+        self.target_history.append(target_index)
         self.reset_dynamics(launch_speed)
+
+    def mark_hit(self, current_time: float):
+        self.attacking = 1
+        self.status = "hit"
+        self.hit_time = current_time
+
+    def mark_failure(self):
+        self.attacking = 1
+        self.status = "lost"
+
+    def set_available_to(self, new_available: List[int]):
+        self.available_to = sorted(set(new_available))
 
     def sync_with_aircraft(self, position, pitch, heading, speed):
         self.X_i, self.Y_i, self.Z_i = position
