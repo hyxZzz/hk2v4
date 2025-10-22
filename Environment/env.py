@@ -1,26 +1,49 @@
-from typing import List
+from __future__ import annotations
 
-import numpy as np
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Tuple
+
 import math as m
+import numpy as np
 from gym import spaces
 
-from flat_models.trajectory import Missiles, Aircraft, Interceptor
-from flat_models.ThreatEvaluate import CalTreat
-from utils.common import CalDistance
-from Environment.ActionDepository import getActionDepository, getNewActionDepository
+from Environment.ActionDepository import getNewActionDepository
 from Environment.reset_env import reset_para
+from flat_models.ThreatEvaluate import CalTreat
+from flat_models.trajectory import Aircraft, Interceptor, Missiles
+from utils.common import CalDistance
 
 act_num = 29  # 机动动作的多少
 Gostep = 1  # 机动策略改变的频率
 
 INTERCEPT_SUCCESS_DISTANCE = 20.0  # 拦截弹与导弹的命中阈值
 MISSILE_HIT_DISTANCE = 20.0  # 来袭导弹命中飞机的阈值
-SPARSE_REWARD_SCALE = 0.75  # 稀疏奖励的尺度
-DANGER_DISTANCE = 3000 # 危险距离 用于奖励函数的非线性分段
-LanchGap = 70 # 发射间隔
-ERRACTIONSCALE = 2 # 惩罚加的系数 原先设为10
-DANGERSCALE = 3 # 危险情况下 距离影响的系数 原先设为5
-CURIOSITYSCALE = 0.5 #  好奇心加数 鼓励探索
+DANGER_DISTANCE = 3000  # 危险距离 用于奖励函数的非线性分段
+LanchGap = 70  # 发射间隔
+ERRACTIONSCALE = 2  # 惩罚加的系数 原先设为10
+DANGERSCALE = 3  # 危险情况下 距离影响的系数 原先设为5
+
+
+class TerminationStatus(Enum):
+    RUNNING = -1
+    FAIL_MISSILE_HIT = 0
+    MANEUVER_SUCCESS = 1
+    INTERCEPT_SUCCESS = 2
+    FAIL_CRASH = 3
+    TIMEOUT = 4
+
+
+@dataclass
+class RewardWeights:
+    height: float = 0.6
+    distance: float = 0.8
+    interceptor_usage: float = 0.4
+    treat: float = 0.4
+    intercept_quality: float = 0.5
+    sparse: float = 0.75
+
+
 class ManeuverEnv:
     """
                         导弹编号	    X位置	Y位置	Z位置	速度	    俯仰角	偏转角
@@ -28,50 +51,83 @@ class ManeuverEnv:
                         拦截弹编号    X位置	Y位置	Z位置	速度	    俯仰角	偏转角
                         """
 
-    def __init__(self, missileList: List[Missiles], aircraftList: Aircraft, planeSpeed=170,
-                 missilesNum=3, spaceSize=5000, missilesSpeed=680, InterceptorNum=8, InterceptorSpeed=540):
-        self.escapeFlag = -1
-        self.action_space = spaces.Discrete(act_num)
-        self.spaceSize = spaceSize
-        self.Treat_t = 0
-        self.action_dep = getNewActionDepository(act_num)
-        """
-            初始化参数：
-            导弹个数    missileNum，
-            导弹初速度   missilesSpeed，
-            导弹对象列表  missileList，
-            飞机对象列表  aircraftList，
-            飞机初速度   planeSpeed，
-            拦截弹数目   InterceptorNum，
-            拦截弹初速度  InterceptorSpeed，
-            空间大小    spaceSize，[Maxstep]
-        """
+    def __init__(
+        self,
+        missileList: List[Missiles],
+        aircraftList: Aircraft,
+        planeSpeed: float = 170.0,
+        missilesNum: int = 3,
+        spaceSize: int = 5000,
+        missilesSpeed: float = 680.0,
+        InterceptorNum: int = 8,
+        InterceptorSpeed: float = 540.0,
+        curiosity_scale: float = 0.5,
+        punish_penalty: float = 1.0,
+        launch_gap: int = LanchGap,
+        reward_weights: RewardWeights | None = None,
+    ) -> None:
+        self.reward_weights = reward_weights or RewardWeights()
+        self.curiosity_scale = curiosity_scale
+        self.punish_penalty = punish_penalty
+        self.launch_gap = max(1, int(launch_gap))
+
+        self.escapeFlag: TerminationStatus = TerminationStatus.RUNNING
+        self.status_messages = {
+            TerminationStatus.RUNNING: 'Go on combating...'.capitalize(),
+            TerminationStatus.FAIL_MISSILE_HIT: 'Hit confirmed, escape failed.',
+            TerminationStatus.MANEUVER_SUCCESS: 'Maneuver success.',
+            TerminationStatus.INTERCEPT_SUCCESS: 'Intercept success.',
+            TerminationStatus.FAIL_CRASH: 'Vehicle lost due to crash.',
+            TerminationStatus.TIMEOUT: 'Mission timeout.',
+        }
+
         self.missileNum = missilesNum
         self.missileSpeed = missilesSpeed
         self.planeSpeed = planeSpeed
         self.interceptorNum = InterceptorNum
         self.interceptorSpeed = InterceptorSpeed
-        self.interceptor_remain = InterceptorNum
+
+        self.action_dep = getNewActionDepository(act_num)
+        self.maneuver_action_count = self.action_dep.shape[0]
+        self.target_bucket = self.missileNum + 1  # -1 表示不发射
+        self.action_space = spaces.Discrete(self.maneuver_action_count * self.target_bucket)
+
+        self.spaceSize = spaceSize
+        self.max_steps = max(1, int(spaceSize))
+        self.Treat_t = 0.0
+
         self.missileList = missileList
         self.aircraftList = aircraftList
-        self.interceptorList = []
+        self.interceptorList: List[Interceptor] = []
+        self.interceptor_remain = InterceptorNum
         self.position_scale = 25000.0
         self.At_1 = 0
-        # 初始化拦截弹列表
+
         for _ in range(InterceptorNum):
             self.interceptorList.append(
-                Interceptor([self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
-                            self.aircraftList.V, self.aircraftList.Pitch, self.aircraftList.Heading))
+                Interceptor(
+                    [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
+                    self.aircraftList.V,
+                    self.aircraftList.Pitch,
+                    self.aircraftList.Heading,
+                )
+            )
 
-        self.observation_planes = np.zeros((1, 6), dtype=np.float32)  # 只有一个飞机
+        self.observation_planes = np.zeros((1, 6), dtype=np.float32)
         self.observation_missiles = np.zeros((self.missileNum, 6), dtype=np.float32)
         self.observation_interceptors = np.zeros((self.interceptorNum, 6), dtype=np.float32)
-        self.StateShape = self.observation_planes.shape[0] + self.observation_missiles.shape[0] + \
-                          self.observation_interceptors.shape[0]
+        self.StateShape = (
+            self.observation_planes.shape[0]
+            + self.observation_missiles.shape[0]
+            + self.observation_interceptors.shape[0]
+        )
+
         self.D0 = np.empty((missilesNum,), dtype=np.float32)
         for i in range(missilesNum):
-            self.D0[i] = CalDistance([self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
-                                     [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z])
+            self.D0[i] = CalDistance(
+                [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
+                [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z],
+            )
         self.t = 0
         self.lanchTime = 0
 
@@ -90,206 +146,112 @@ class ManeuverEnv:
             控制量nx,nz,roll和俯仰角限制标识                        
         """
 
-    def AirCraftActions(self, commandNum: int, interceptor_goal):
-        # 动作库字典：[nx, ny, roll, Pitch]
+    def AirCraftActions(self, commandNum: int, interceptor_goal: int) -> Tuple[np.ndarray, int]:
+        commandNum = int(np.clip(commandNum, 0, self.maneuver_action_count - 1))
         action = self.action_dep[commandNum][0:4]
-        # interceptor_goal = int(self.action_dep[commandNum][4])
-        LauchFlag = self.LanchPolicy(interceptor_goal)
-        if LauchFlag:
-            interceptor_goal = interceptor_goal
-        else:
-            interceptor_goal = -1
+        launch_successful = self.LanchPolicy(interceptor_goal)
+        actual_goal = interceptor_goal if launch_successful else -1
+        return action, actual_goal
 
-        return action, interceptor_goal
+    def decode_action(self, action: int) -> Tuple[int, int]:
+        action = int(np.clip(action, 0, self.action_space.n - 1))
+        maneuver_idx = action // self.target_bucket
+        interceptor_bucket = action % self.target_bucket
+        interceptor_goal = interceptor_bucket - 1
+        return maneuver_idx, interceptor_goal
+
+    def _set_status(self, status: TerminationStatus) -> None:
+        self.escapeFlag = status
+
+    def _build_info(self) -> dict:
+        return {
+            'status': self.escapeFlag.name,
+            'code': self.escapeFlag.value,
+            'message': self.status_messages[self.escapeFlag],
+        }
+
+    def _advance_environment(self, nx: float, ny: float, roll: float, pitch: float) -> np.ndarray:
+        self._set_status(TerminationStatus.RUNNING)
+
+        if self.t >= self.max_steps:
+            self._set_status(TerminationStatus.TIMEOUT)
+            return self._get_obs()
+
+        tx, ty, tz = self.aircraftList.AircraftPostition(None, nx, ny, roll, pitch)
+        self.observation_planes[0] = np.array(
+            [tx, ty, tz, self.aircraftList.Pitch, self.aircraftList.Heading, self.aircraftList.roll]
+        )
+
+        x_a, y_a, z_a = self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z
+        v_a, Pitch_a, Heading_a = self.aircraftList.V, self.aircraftList.Pitch, self.aircraftList.Heading
+        ac_list = [x_a, y_a, z_a]
+
+        active_missiles = 0
+        for missile_index, missile in enumerate(self.missileList):
+            if not missile.attacking:
+                self.observation_missiles[missile_index] = np.array(
+                    [missile.X, missile.Y, missile.Z, missile.Pitch, missile.Heading, 0]
+                )
+                continue
+
+            active_missiles += 1
+            mx, my, mz = missile.MissilePosition(ac_list, v_a, Pitch_a, Heading_a)
+            self.observation_missiles[missile_index] = np.array(
+                [mx, my, mz, missile.Pitch, missile.Heading, 0]
+            )
+            dist = m.sqrt((x_a - mx) ** 2 + (y_a - my) ** 2 + (z_a - mz) ** 2)
+
+            for itr_index, interceptor in enumerate(self.interceptorList):
+                if interceptor.T_i == -1:
+                    interceptor.sync_with_aircraft(
+                        [x_a, y_a, z_a], Pitch_a, Heading_a, self.aircraftList.V
+                    )
+                    self.observation_interceptors[itr_index] = np.array(
+                        [x_a, y_a, z_a, Pitch_a, Heading_a, 0]
+                    )
+                    continue
+
+                if interceptor.attacking == 1:
+                    continue
+
+                ix, iy, iz = interceptor.X_i, interceptor.Y_i, interceptor.Z_i
+                if interceptor.T_i == missile_index:
+                    ix, iy, iz = interceptor.InterceptorPosition(
+                        [mx, my, mz], missile.V, missile.Pitch, missile.Heading
+                    )
+                    dist_im = m.sqrt((ix - mx) ** 2 + (iy - my) ** 2 + (iz - mz) ** 2)
+                    if dist_im < INTERCEPT_SUCCESS_DISTANCE:
+                        missile.attacking = False
+                        interceptor.attacking = 1
+                self.observation_interceptors[itr_index] = np.array(
+                    [ix, iy, iz, interceptor.Pitch_i, interceptor.Heading_i, 0]
+                )
+
+            if dist < MISSILE_HIT_DISTANCE:
+                self._set_status(TerminationStatus.FAIL_MISSILE_HIT)
+                return self._get_obs()
+
+        if active_missiles == 0:
+            self._set_status(TerminationStatus.INTERCEPT_SUCCESS)
+
+        return self._get_obs()
 
     def constraint_obs(self, act: List, speedFlag):
-
-        #   取出机动动作
-        # nx = aircraftList.nx
-        # ny = aircraftList.ny
-        # roll = aircraftList.roll
-        nx, ny, roll, Pitch = act
+        nx, ny, roll, pitch = act
         if speedFlag:
             nx = m.sin(self.aircraftList.Pitch)
         else:
-            ny = m.cos(self.aircraftList.Pitch) / m.cos(self.aircraftList.roll)
+            ny = m.cos(self.aircraftList.Pitch) / max(m.cos(self.aircraftList.roll), 1e-6)
             roll = self.aircraftList.roll
-            Pitch = -1
-        info = 'Go on Combating...'
-        escapeFlag = -1  # 是否逃离标志，0未逃离，1机动逃离，2拦截完毕
+            pitch = -1
 
-        # 检查是否到了逃逸空间，如果比最大步数多，则机动逃逸
-        if self.t >= self.spaceSize:
-            escapeFlag = 1
-            self.escapeFlag = escapeFlag
-            info = 'Maneuver Success'
-            return np.concatenate(
-                (self.observation_planes, self.observation_missiles, self.observation_interceptors)), escapeFlag, info
-
-        tx, ty, tz = self.aircraftList.AircraftPostition(None, nx, ny, roll, Pitch)  # 目前只有一个飞机
-        self.observation_planes[0] = np.array(
-            [tx, ty, tz, self.aircraftList.Pitch, self.aircraftList.Heading, self.aircraftList.roll])
-        x_a, y_a, z_a, v_a, Pitch_a, Heading_a = self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z, self.aircraftList.V, \
-                                                 self.aircraftList.Pitch, self.aircraftList.Heading  # 获取飞机位置等信息
-        ac_list = [x_a, y_a, z_a]  # 飞机位置列表，用于导弹传参
-
-        # 检查来袭导弹是否拦截完毕，全部导弹不在飞行则逃逸成功
-        does_inter_over = 0
-        for j in range(len(self.missileList)):
-            if not self.missileList[j].attacking:
-                does_inter_over += 1
-        if does_inter_over == len(self.missileList):
-            escapeFlag = 2
-            self.escapeFlag = escapeFlag
-            info = 'Intercept Success'
-            return np.concatenate(
-                (self.observation_planes, self.observation_missiles,
-                 self.observation_interceptors)), self.escapeFlag, info
-
-        # 根据飞机信息更新导弹
-        for i in range(len(self.missileList)):
-            if self.missileList[i].attacking:
-                # 获取其中一个导弹的x,y,z坐标
-                mx, my, mz = self.missileList[i].MissilePosition(ac_list, v_a, Pitch_a, Heading_a)
-                # 添加到导弹状态数组中
-                self.observation_missiles[i] = np.array(
-                    [mx, my, mz, self.missileList[i].Pitch, self.missileList[i].Heading, 0])
-                # 计算导弹与飞机的距离
-                dist = m.sqrt((x_a - mx) ** 2 + (y_a - my) ** 2 + (z_a - mz) ** 2)
-
-                """
-                    进行拦截计算：
-                    对每一个拦截弹来说，其锁定的目标来袭导弹是一定的，根据锁定目标的索引来计算彼此的距离，
-                    如果小于阈值，则拦截成功。置被拦截目标导弹和拦截弹的飞行状态为False。
-                """
-
-                # 拦截弹如果没有发射，随飞机一起飞行
-                for j in range(len(self.interceptorList)):
-                    if self.interceptorList[j].T_i == -1:
-                        self.interceptorList[j].sync_with_aircraft(
-                            [x_a, y_a, z_a], Pitch_a, Heading_a, self.aircraftList.V
-                        )
-                        self.observation_interceptors[j] = np.array([x_a, y_a, z_a, Pitch_a, Heading_a, 0])
-                    ix, iy, iz = self.interceptorList[j].X_i, self.interceptorList[j].Y_i, self.interceptorList[j].Z_i
-
-                    # 拦截弹发射成功，根据起拦截目标更新位置
-                    if self.interceptorList[j].T_i == i and self.interceptorList[j].attacking != 1:
-                        ix, iy, iz = self.interceptorList[j].InterceptorPosition([mx, my, mz], self.missileList[i].V,
-                                                                                 self.missileList[i].Pitch,
-                                                                                 self.missileList[i].Heading)
-                        self.observation_interceptors[j] = np.array(
-                            [ix, iy, iz, self.interceptorList[j].Pitch_i, self.interceptorList[j].Heading_i, 0])
-                        dist_im = m.sqrt((ix - mx) ** 2 + (iy - my) ** 2 + (iz - mz) ** 2)
-                        # 拦截弹拦截成功
-                        if dist_im < INTERCEPT_SUCCESS_DISTANCE:
-                            self.missileList[i].attacking = False  # 拦截使来袭导弹失效
-                            self.interceptorList[j].attacking = 1  # 拦截导弹牺牲
-
-                # 被i导弹打中
-                if dist < MISSILE_HIT_DISTANCE:
-                    escapeFlag = 0  # 被导弹击中，未逃离
-                    self.escapeFlag = escapeFlag
-                    info = 'Hit on! Escape Fail!!'
-                    return np.concatenate((self.observation_planes, self.observation_missiles,
-                                           self.observation_interceptors)), self.escapeFlag, info
-        self.escapeFlag = escapeFlag
-        return np.concatenate(
-            (self.observation_planes, self.observation_missiles, self.observation_interceptors)), self.escapeFlag, info
+        obs = self._advance_environment(nx, ny, roll, pitch)
+        return obs, self.escapeFlag.value, self._build_info()
 
     def generate_obs(self, act: List):
-
-        #   取出机动动作
-        nx, ny, roll, Pitch = act
-        #
-        # if self.aircraftList.V > 3.4 * 1.2:
-        #     nx = 0
-
-        escapeFlag = -1  # 是否逃离标志，0未逃离，1机动逃离，2拦截完毕
-        info = 'Go on Combating...'
-
-        # # 检查导弹是否触底，触底则失效
-        # for i in range(len(self.missileList)):
-        #     if self.missileList[i].Y <= 0:
-        #         self.missileList[i].attacking = False
-
-        # 检查是否到了逃逸空间，如果比最大步数多，则机动逃逸
-        if self.t >= self.spaceSize:
-            escapeFlag = 1
-            self.escapeFlag = escapeFlag
-            info = 'Maneuver Success'
-            return np.concatenate(
-                (self.observation_planes, self.observation_missiles, self.observation_interceptors)), escapeFlag, info
-
-        tx, ty, tz = self.aircraftList.AircraftPostition(None, nx, ny, roll, Pitch)  # 目前只有一个飞机
-        self.observation_planes[0] = np.array(
-            [tx, ty, tz, self.aircraftList.Pitch, self.aircraftList.Heading, self.aircraftList.roll])
-        x_a, y_a, z_a, v_a, Pitch_a, Heading_a = self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z, self.aircraftList.V, \
-                                                 self.aircraftList.Pitch, self.aircraftList.Heading  # 获取飞机位置等信息
-        ac_list = [x_a, y_a, z_a]  # 飞机位置列表，用于导弹传参
-
-        # 检查来袭导弹是否拦截完毕，全部导弹不在飞行则逃逸成功
-        does_inter_over = 0
-        for j in range(len(self.missileList)):
-            if not self.missileList[j].attacking:
-                does_inter_over += 1
-        if does_inter_over == len(self.missileList):
-            escapeFlag = 2
-            self.escapeFlag = escapeFlag
-            info = 'Intercept Success'
-            return np.concatenate(
-                (self.observation_planes, self.observation_missiles, self.observation_interceptors)), escapeFlag, info
-
-        # 根据飞机信息更新导弹
-        for i in range(len(self.missileList)):
-            if self.missileList[i].attacking:
-                # 获取其中一个导弹的x,y,z坐标
-                mx, my, mz = self.missileList[i].MissilePosition(ac_list, v_a, Pitch_a, Heading_a)
-                # 添加到导弹状态数组中
-                self.observation_missiles[i] = np.array(
-                    [mx, my, mz, self.missileList[i].Pitch, self.missileList[i].Heading, 0])
-                # 计算导弹与飞机的距离
-                dist = m.sqrt((x_a - mx) ** 2 + (y_a - my) ** 2 + (z_a - mz) ** 2)
-
-                """
-                    进行拦截计算：
-                    对每一个拦截弹来说，其锁定的目标来袭导弹是一定的，根据锁定目标的索引来计算彼此的距离，
-                    如果小于阈值，则拦截成功。置被拦截目标导弹和拦截弹的飞行状态为False。
-                """
-
-                # 拦截弹如果没有发射，随飞机一起飞行
-                for j in range(len(self.interceptorList)):
-                    if self.interceptorList[j].T_i == -1:
-                        self.interceptorList[j].X_i = x_a
-                        self.interceptorList[j].Y_i = y_a
-                        self.interceptorList[j].Z_i = z_a
-                        self.interceptorList[j].Pitch_i = Pitch_a
-                        self.interceptorList[j].Heading_i = Heading_a
-                        self.observation_interceptors[j] = np.array([x_a, y_a, z_a, Pitch_a, Heading_a, 0])
-                    ix, iy, iz = self.interceptorList[j].X_i, self.interceptorList[j].Y_i, self.interceptorList[j].Z_i
-
-                    # 拦截弹发射成功，根据起拦截目标更新位置
-                    if self.interceptorList[j].T_i == i and self.interceptorList[j].attacking != 1:
-                        ix, iy, iz = self.interceptorList[j].InterceptorPosition([mx, my, mz], self.missileList[i].V,
-                                                                                 self.missileList[i].Pitch,
-                                                                                 self.missileList[i].Heading)
-                        self.observation_interceptors[j] = np.array(
-                            [ix, iy, iz, self.interceptorList[j].Pitch_i, self.interceptorList[j].Heading_i, 0])
-                        dist_im = m.sqrt((ix - mx) ** 2 + (iy - my) ** 2 + (iz - mz) ** 2)
-                        # 拦截弹拦截成功
-                        if dist_im < INTERCEPT_SUCCESS_DISTANCE:
-                            self.missileList[i].attacking = False  # 拦截使来袭导弹失效
-                            self.interceptorList[j].attacking = 1  # 拦截导弹牺牲
-
-                # 被i导弹打中
-                if dist < MISSILE_HIT_DISTANCE:
-                    escapeFlag = 0  # 被导弹击中，未逃离
-                    self.escapeFlag = escapeFlag
-                    info = 'Hit on! Escape Fail!!'
-                    return np.concatenate((self.observation_planes, self.observation_missiles,
-                                           self.observation_interceptors)), escapeFlag, info
-        self.escapeFlag = escapeFlag
-        return np.concatenate(
-            (self.observation_planes, self.observation_missiles, self.observation_interceptors)), self.escapeFlag, info
+        nx, ny, roll, pitch = act
+        obs = self._advance_environment(nx, ny, roll, pitch)
+        return obs, self.escapeFlag.value, self._build_info()
 
     """
             动作生成函数，输入机动策略序号与拦截目标导弹序号
@@ -366,54 +328,48 @@ class ManeuverEnv:
     
         """
 
-    def heightReward(self, h):
-
-        safe_min = 8000
-        safe_max = 12000
-        tolerance = 1000
+    def heightReward(self, h: float) -> float:
+        safe_min = 8000.0
+        safe_max = 12000.0
+        tolerance = 1000.0
         hard_min = safe_min - tolerance
         hard_max = safe_max + tolerance
 
         if h < hard_min or h > hard_max:
-            self.escapeFlag = 0  # 撞地结束或高度过高失速结束
-            return -1.5
+            self._set_status(TerminationStatus.FAIL_CRASH)
+            return -1.0
 
         if h < safe_min:
-            ratio = (h - hard_min) / (safe_min - hard_min)
-            return -1.0 + 2.0 * ratio
+            ratio = (h - hard_min) / max(safe_min - hard_min, 1.0)
+            return -1.0 + 2.0 * np.clip(ratio, 0.0, 1.0)
         if h > safe_max:
-            ratio = (hard_max - h) / (hard_max - safe_max)
-            return -1.0 + 2.0 * ratio
+            ratio = (hard_max - h) / max(hard_max - safe_max, 1.0)
+            return -1.0 + 2.0 * np.clip(ratio, 0.0, 1.0)
 
         center = (safe_min + safe_max) / 2.0
-        span = (safe_max - safe_min) / 2.0
+        span = max((safe_max - safe_min) / 2.0, 1.0)
         offset = (h - center) / span
-        return 1.0 - offset ** 2
+        return float(np.clip(1.0 - offset ** 2, -1.0, 1.0))
 
     """
         距离奖励：
         输入：导弹向量
         输出：奖励值【-1.608， 1】
     """
-    def distanceReward(self, missileState, planeState):
+    def distanceReward(self, missileState: np.ndarray, planeState: np.ndarray) -> float:
+        min_reward = 0.0
+        has_active = False
+        for idx in range(missileState.shape[0]):
+            if not self.missileList[idx].attacking:
+                continue
+            has_active = True
+            distance = float(np.linalg.norm(missileState[idx][:3] - planeState[:3]))
+            normalized = (distance - DANGER_DISTANCE) / max(DANGER_DISTANCE, 1.0)
+            reward = float(np.clip(normalized, -1.0, 1.0))
+            if idx == 0 or reward < min_reward:
+                min_reward = reward
 
-        rd = 0
-        rdMin = 10e8
-        engagement_range = 25000.0
-        for i in range(missileState.shape[0]):
-            if self.missileList[i].attacking:
-                D = abs(np.linalg.norm((missileState[i] - planeState)))
-                D = max(D, 1.0)
-                scale = engagement_range / max(DANGER_DISTANCE, 1.0)
-                if scale <= 1:
-                    rd = -1.5
-                else:
-                    rd = m.log(D / DANGER_DISTANCE) / m.log(scale)
-                rd = max(min(rd, 1.0), -1.5)
-        # 计算奖励最小的导弹
-            if rd < rdMin:
-                rdMin = rd
-        return rdMin
+        return min_reward if has_active else 0.0
 
 
 
@@ -427,211 +383,83 @@ class ManeuverEnv:
         成型奖励值
     """
 
-    def commonReward(self, state, interceptor_goal):
-        planeState = state[0]
-        missileState = state[1:self.missileNum + 1]
-        rd = 0
-        # 距离最近的导弹距离 和其本身的索引
-        dist, missile_index = self.getClosetMissileDist()
-        # 危险标志 此标志为TRUE时 将距离奖励变大 拦截奖励变大 拦截惩罚变小
-        dangerFlag = False
-        if dist <= DANGER_DISTANCE:
-            dangerFlag = True
+    def commonReward(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> float:
+        plane_state = state[0]
+        missile_state = state[1 : self.missileNum + 1]
 
-        """
-            飞机高度奖励，防止撞地
-        """
+        closest_dist, threat_index = self.getClosetMissileDist()
+        danger_flag = closest_dist <= DANGER_DISTANCE
 
-        C1 = 1.2  # 飞机高度奖励的系数
-        h = planeState[1]
-        rh = self.heightReward(h)
-        rd += C1 * rh
+        height_component = self.heightReward(float(plane_state[1]))
+        distance_component = self.distanceReward(missile_state, plane_state)
 
-        """
-            距离大时发射拦截弹的惩罚
-            [-3, 0]
-            """
-        for i in range(len(self.interceptorList)):
-            target_index = self.interceptorList[i].T_i
-            # 发射了拦截弹的目标
-            if target_index != -1:
-                # 与发射目标的原始距离
-                D0 = abs(self.D0[target_index])
-                # 与发射目标的实时距离
-                D = abs(np.linalg.norm((missileState[target_index] - planeState)))
-                # 如果距离大于一半 惩罚
-                if D > D0 / 2:
-                    rd -= 0.4
-                    # 如果当前动作是发射远距离的导弹 这一步视为错误
-                    if interceptor_goal == target_index:
-                        rd -= ERRACTIONSCALE
-
-
-
-
-
-        """ 
-                    导弹与飞机相对距离奖励
-                    [0,1]
-                """
-        C2 = 1
-        rd_o = 0
-        for i in range(missileState.shape[0]):
-            D0 = abs(self.D0[i])
-            D = abs(np.linalg.norm((missileState[i] - planeState)))
-            if D0 < 1e-8:
-                rd = - 1
-                self.escapeFlag = 0
-            else:
-                rd_o += C2 * (D / D0)
-        rd_o = rd_o / missileState.shape[0]
-        rd += C2 * rd_o
-
-
-        """
-                导弹与飞机实时距离标量奖励
-                正常下：【-1.608， 1】
-                距离近下：【-8,0】
-                """
-
-        r_Dd = self.distanceReward(missileState, planeState)
-        if dangerFlag:
-            C2 = DANGERSCALE
-        rd += C2 * r_Dd
-
-
-        """
-                   剩余拦截弹奖励rm
-                   正常下：0
-                   危机下：【-12,0】
-               """
-        rm = 0
-        if dangerFlag:
-            active_missiles = max(1, self.getRemainMissileNum())
-            idle_interceptors = sum(1 for itr in self.interceptorList if itr.attacking == -1)
-            if self.LockConstraint(missile_index) and idle_interceptors > 0:
-                focus_penalty = idle_interceptors / active_missiles
-                if interceptor_goal not in (-1, missile_index):
-                    focus_penalty += 1 / active_missiles
-                rm = -DANGERSCALE * focus_penalty
-        rd += rm
-
-        """
-                    威胁度奖励
-                    【-1,0.25】
-                """
-        C5 = 1
-        Treat = 0
-        plane_position = planeState
+        treat_value = 0.0
         v_p = self.aircraftList.V
-        for i in range(missileState.shape[0]):
-            if self.missileList[i].attacking:
-                missile_position = missileState[i]
-                v_m = self.missileList[i].V
-                if Treat < CalTreat(plane_position, missile_position, v_p, v_m):
-                    Treat = CalTreat(plane_position, missile_position, v_p, v_m)
-                    if Treat < 0:
-                        assert 'TreatCompute Wrong!!'
-        if Treat <= self.Treat_t:
-            self.Treat_t = Treat
-            rd += 0.25 * C5 * Treat
-        else:
-            self.Treat_t = Treat
-            rd += - 1 * C5 * Treat    # 负的要狠
-        if rd < -1:
-            assert 'TreatCompute Wrong!!'
+        for idx in range(missile_state.shape[0]):
+            if not self.missileList[idx].attacking:
+                continue
+            missile_pos = missile_state[idx]
+            v_m = self.missileList[idx].V
+            treat_value = max(treat_value, CalTreat(plane_state, missile_pos, v_p, v_m))
+        treat_component = float(np.clip(treat_value / 10.0, -1.0, 1.0))
 
-        """
-            拦截弹发射的奖励：
-            当载机和来袭弹的距离相差较小时，发射拦截弹加奖励
-            当载机和来袭弹的角度合适是，发射拦截弹加奖励
-            当二者都合适时，发射拦截弹加大的奖励
-        """
-        rl = 0
+        interceptor_component = 0.0
+        if actual_goal == threat_index and actual_goal != -1:
+            interceptor_component = 1.0
+        elif actual_goal == -1 and danger_flag:
+            interceptor_component = -1.0
+        elif actual_goal not in (-1, threat_index):
+            interceptor_component = -0.6
+        elif desired_goal != actual_goal and desired_goal >= 0:
+            interceptor_component = -0.3
 
-        # 当有一个导弹距离近时
-        if dangerFlag:
-            engaged_on_threat = 0
-            wrong_lock = 0
-            for itr in self.interceptorList:
-                if itr.attacking != -1 and itr.T_i == missile_index:
-                    engaged_on_threat += 1
-                elif itr.attacking != -1 and itr.T_i not in (-1, missile_index):
-                    wrong_lock += 1
+        quality_component = 0.0
+        engaged_count = 0
+        aligned_count = 0
+        for interceptor in self.interceptorList:
+            if interceptor.attacking in (-1, 1):
+                continue
+            engaged_count += 1
+            if interceptor.T_i == threat_index:
+                aligned_count += 1
+        if engaged_count > 0:
+            quality_component = np.clip(2.0 * aligned_count / engaged_count - 1.0, -1.0, 1.0)
 
-            rl += 1.8 * engaged_on_threat
-            can_focus = self.LockConstraint(missile_index)
-            if can_focus:
-                rl -= ERRACTIONSCALE * wrong_lock
-                if interceptor_goal == missile_index:
-                    rl += 0.6
-                elif interceptor_goal not in (-1, missile_index):
-                    rl -= ERRACTIONSCALE * 0.5
-        rd += rl
+        reward = (
+            self.reward_weights.height * height_component
+            + self.reward_weights.distance * distance_component
+            + self.reward_weights.treat * treat_component
+            + self.reward_weights.interceptor_usage * interceptor_component
+            + self.reward_weights.intercept_quality * quality_component
+        )
 
-        """
-            引导拦截弹拦截奖励
-            拦截弹对锁定目标的威胁度越高，奖励越大
-            正常情况下：【-0.5，0.5】
-            危急情况下：【-2.5，2.5】
-        """
-        # C6 = 8
-        C6 = 1
-        ri = 0
-        lock_num = 0
-        for itr in self.interceptorList:
-
-            # 拦截弹已发射且没有牺牲
-            if itr.attacking != -1 and itr.attacking != 1:
-                # 锁的当前最近的
-                if itr.T_i == missile_index:
-                    ri += CalTreat(missileState[itr.T_i], [itr.X_i, itr.Y_i, itr.Z_i, itr.Pitch_i, itr.Heading_i, 0], self.missileList[itr.T_i].V, itr.V_i)
-
-                # 不是当前最近的
-                else:
-                    ri -= CalTreat(missileState[itr.T_i], [itr.X_i, itr.Y_i, itr.Z_i, itr.Pitch_i, itr.Heading_i, 0], self.missileList[itr.T_i].V, itr.V_i)
-                lock_num += 1
-
-        # 防止没有拦截弹发射时导致的除法错误
-        if lock_num != 0:
-            if dangerFlag:
-                C6 = DANGERSCALE
-            rd += C6 * ri / lock_num
-
-        # if rd > 51 or rd < -20:
-        #     print(rd)
-        return rd
-
+        return float(np.clip(reward, -4.0, 4.0))
     """
         机动不合规惩罚
     """
 
-    def Punish(self):
-        rp = 1
-        # rp = 12
-        return -rp
+    def Punish(self) -> float:
+        return -float(self.punish_penalty)
 
     """
             稀疏奖励
         """
 
-    def SparseReward(self):
-        rd = 0
-        C4 = SPARSE_REWARD_SCALE
+    def SparseReward(self) -> float:
+        base = self.reward_weights.sparse
+        status = self.escapeFlag
 
-        # C4 = 100
-        if self.escapeFlag == -1:
+        if status is TerminationStatus.RUNNING:
             dist, _ = self.getClosetMissileDist()
             danger_multiplier = 1.0 if dist <= DANGER_DISTANCE else 0.5
-            rd = - 0.06 * C4 * danger_multiplier * self.getRemainMissileNum() # 每一颗存在的导弹都要有惩罚
-        elif self.escapeFlag == 0:
-            rd = - C4
-        elif self.escapeFlag == 1:
-            rd = C4
-        elif self.escapeFlag == 2:
-            rd = C4
-
-        return rd
+            return -0.05 * base * danger_multiplier * self.getRemainMissileNum()
+        if status in (TerminationStatus.FAIL_MISSILE_HIT, TerminationStatus.FAIL_CRASH):
+            return -base
+        if status in (TerminationStatus.MANEUVER_SUCCESS, TerminationStatus.INTERCEPT_SUCCESS):
+            return base
+        if status is TerminationStatus.TIMEOUT:
+            return -0.2 * base
+        return 0.0
 
     """
             奖励函数：输入当前状态，输出奖励值
@@ -642,13 +470,11 @@ class ManeuverEnv:
             奖励值Reward
         """
 
-    def rewards(self, state, interceptor_goal):
-        comReward = self.commonReward(state, interceptor_goal)
-        sparseReward = self.SparseReward()
-        reward = comReward + sparseReward
-        # if reward < -1000 or reward > 1000:
-        #     print(reward)
-        return reward
+    def rewards(self, state: np.ndarray, actual_goal: int, desired_goal: int) -> float:
+        shaped = self.commonReward(state, actual_goal, desired_goal)
+        sparse = self.SparseReward()
+        total = shaped + sparse
+        return float(np.clip(total, -5.0, 5.0))
 
     '''获取剩余导弹个数'''
     def getRemainMissileNum(self):
@@ -675,162 +501,101 @@ class ManeuverEnv:
 
     """获取动作信息 将动作索引输入 输出三控制量的具体信息和拦截目标"""
 
-    def getActionData(self, action, interceptor_goal=None):
-        # 距离最近的导弹距离 和其本身的索引
-        dist, missile_index = self.getClosetMissileDist()
-        # 危险标志 此标志为TRUE时 将距离奖励变大 拦截奖励变大 拦截惩罚变小
-        dangerFlag = False
-        if dist <= DANGER_DISTANCE:
-            dangerFlag = True
-        if dangerFlag:
-            goal = missile_index
-        else:
-            goal = -1
+    def getActionData(self, action: int) -> Tuple[List[float], int, int]:
+        maneuver_idx, desired_goal = self.decode_action(action)
+        upper_bound = max(self.missileNum - 1, -1)
+        desired_goal = int(np.clip(desired_goal, -1, upper_bound))
+        control, actual_goal = self.AirCraftActions(maneuver_idx, desired_goal)
+        return control.tolist(), actual_goal, desired_goal
 
-        if interceptor_goal == None:
-            [nx, ny, roll, pitch_constraint], interceptor_goal = self._gen_action(action, goal)
-        else:
-            [nx, ny, roll, pitch_constraint], interceptor_goal = self._gen_action(action, interceptor_goal)
-        return [nx, ny, roll, pitch_constraint], interceptor_goal
-
-    def step(self, action):
-        state = self._get_obs()
-        escapeFlag = -1
-        info = ''
-        # 第一次进入环境时 将action给at-1
+    def step(self, action: int):
+        _ = self._get_obs()
         if self.t == 0:
             self.At_1 = action
 
-        [nx, ny, roll, pitch_constraint], interceptor_goal = self.getActionData(action)
-        # 判断动作是否合理
-        # 速度合理标识
+        control, actual_goal, desired_goal = self.getActionData(action)
+        nx, ny, roll, pitch_constraint = control
+
+        launch_allowed = not (self.interceptor_remain == 0 and actual_goal != -1)
+        valid_action = (
+            self.aircraftList.action_constraint(pitch_constraint)
+            and self.aircraftList.speed_constraint(nx)
+            and launch_allowed
+        )
+
         speed_flag = True
-        lauch_flag = not (self.interceptor_remain == 0 and interceptor_goal != -1)
-        if self.aircraftList.action_constraint(pitch_constraint) and self.aircraftList.speed_constraint(nx) and lauch_flag:
+        info = {}
+        if valid_action:
             for _ in range(Gostep):
-                state, escapeFlag, info = self.generate_obs([nx, ny, roll, pitch_constraint])
-            reward = self.rewards(state, interceptor_goal)
-
-            # 好奇心机制
-            if action != self.At_1:
-                reward += CURIOSITYSCALE
-
-
-            # # 强制让网络选不同的动作试试
-            # if action == self.At_3:
-            #     reward = -10000
-            # reward = 0
-            # if action == 50:
-            #     reward +=5000
-            self.t += 1
-            self.At_1 = action
-
+                state, _, info = self.generate_obs(control)
+                if self.escapeFlag is not TerminationStatus.RUNNING:
+                    break
+            reward = self.rewards(state, actual_goal, desired_goal)
         else:
-            info = 'Constraint!!'
             for _ in range(Gostep):
-                state, escapeFlag, info = self.constraint_obs([nx, ny, roll, pitch_constraint], speed_flag)
+                state, _, info = self.constraint_obs(control, speed_flag)
+                if self.escapeFlag is not TerminationStatus.RUNNING:
+                    break
+            reward = self.rewards(state, actual_goal, desired_goal) + self.Punish()
+            info = {**info, 'constraint_violation': True}
 
-            reward = self.rewards(state, interceptor_goal)
-            reward = self.Punish() + reward
-            # 好奇心机制
-            if action != self.At_1:
-                reward += CURIOSITYSCALE
-                # # 强制让网络选不同的动作试试
-            # if action == self.At_3:
-            #     reward = -10000
-            # reward = 0
-            # if action == 50:
-            #     reward +=5000
-            self.t += 1
-            self.At_1 = action
+        if valid_action:
+            info = {**info, 'constraint_violation': False}
 
+        if action != self.At_1:
+            reward += self.curiosity_scale
 
+        self.t += 1
+        self.At_1 = action
 
-                    # state无量纲化
-        state = self.normalizeState(state, reverse=False)
-        # state[:, 0:3] = state[:, 0:3] / 20000
-        # state[:, 3:6] = state[:, 3:6] / m.pi
-        state = self._get_flattenstate(state)  # 获取拉直的向量
-
-        state = self._genNewState_()
-        return state, reward, self.escapeFlag, info
+        observation = self._genNewState_()
+        return observation, reward, self.escapeFlag.value, info
 
 
     """对比实验的策略"""
 
-    def compareTest(self, action):
-        state = self._get_obs()
-        escapeFlag = -1
-        info = ''
-        # 第一次进入环境时 将action给at-1
+    def compareTest(self, action: int):
+        _ = self._get_obs()
         if self.t == 0:
             self.At_1 = action
 
-        if self.t % 2 == 0:
-            interceptor_goal = 0
-        else:
-            interceptor_goal = 1
+        forced_goal = 0 if self.t % 2 == 0 else 1
+        maneuver_idx, _ = self.decode_action(action)
+        control, actual_goal = self.AirCraftActions(maneuver_idx, forced_goal)
 
-        [nx, ny, roll, pitch_constraint], interceptor_goal = self.getActionData(action, interceptor_goal)
-        # 判断动作是否合理
-        # 速度合理标识
+        nx, ny, roll, pitch_constraint = control
+        launch_allowed = not (self.interceptor_remain == 0 and actual_goal != -1)
         speed_flag = True
-        lauch_flag = not (self.interceptor_remain == 0 and interceptor_goal != -1)
-        if self.aircraftList.action_constraint(pitch_constraint) and self.aircraftList.speed_constraint(nx) and lauch_flag:
+
+        if self.aircraftList.action_constraint(pitch_constraint) and self.aircraftList.speed_constraint(nx) and launch_allowed:
             for _ in range(Gostep):
-                state, escapeFlag, info = self.generate_obs([nx, ny, roll, pitch_constraint])
-            reward = self.rewards(state, interceptor_goal)
-
-            # 好奇心机制
-            if action != self.At_1:
-                reward += CURIOSITYSCALE
-
-
-            # # 强制让网络选不同的动作试试
-            # if action == self.At_3:
-            #     reward = -10000
-            # reward = 0
-            # if action == 50:
-            #     reward +=5000
-            self.t += 1
-            self.At_1 = action
-
+                state, _, info = self.generate_obs(control)
+                if self.escapeFlag is not TerminationStatus.RUNNING:
+                    break
+            reward = self.rewards(state, actual_goal, forced_goal)
+            info = {**info, 'constraint_violation': False}
         else:
-            info = 'Constraint!!'
             for _ in range(Gostep):
-                state, escapeFlag, info = self.constraint_obs([nx, ny, roll, pitch_constraint], speed_flag)
+                state, _, info = self.constraint_obs(control, speed_flag)
+                if self.escapeFlag is not TerminationStatus.RUNNING:
+                    break
+            reward = self.rewards(state, actual_goal, forced_goal) + self.Punish()
+            info = {**info, 'constraint_violation': True}
 
-            reward = self.rewards(state, interceptor_goal)
-            reward = self.Punish() + reward
-            # 好奇心机制
-            if action != self.At_1:
-                reward += CURIOSITYSCALE
-                # # 强制让网络选不同的动作试试
-            # if action == self.At_3:
-            #     reward = -10000
-            # reward = 0
-            # if action == 50:
-            #     reward +=5000
-            self.t += 1
-            self.At_1 = action
+        if action != self.At_1:
+            reward += self.curiosity_scale
 
-
-
-                    # state无量纲化
-        state = self.normalizeState(state, reverse=False)
-        # state[:, 0:3] = state[:, 0:3] / 20000
-        # state[:, 3:6] = state[:, 3:6] / m.pi
-        state = self._get_flattenstate(state)  # 获取拉直的向量
+        self.t += 1
+        self.At_1 = action
 
         state = self._genNewState_()
-        return state, reward, self.escapeFlag, info
+        return state, reward, self.escapeFlag.value, info
 
     def reset(self):
         missilesNum = self.missileNum
         self.Treat_t = 0
         self.interceptor_remain = self.interceptorNum
-        self.escapeFlag = -1
-        info = 'Go on Combating...'
+        self._set_status(TerminationStatus.RUNNING)
         missileList, aircraftList, planeSpeed, missiles_num, spaceSize, missilesSpeed = reset_para(
             num_missiles=missilesNum)
         self.missileNum = missilesNum
@@ -840,6 +605,8 @@ class ManeuverEnv:
         self.aircraftList = aircraftList
         self.interceptorList = []
         self.position_scale = 25000.0
+        self.target_bucket = self.missileNum + 1
+        self.action_space = spaces.Discrete(self.maneuver_action_count * self.target_bucket)
         # 初始化拦截弹列表
         for i in range(self.interceptorNum):
             self.interceptorList.append(Interceptor([self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
@@ -865,21 +632,25 @@ class ManeuverEnv:
                 [aircraftList.X, aircraftList.Y, aircraftList.Z, aircraftList.Pitch, aircraftList.Heading, 0],
                 dtype=np.float32)
 
-        self.StateShape = self.observation_planes.shape[0] + self.observation_missiles.shape[0] + \
-                          self.observation_interceptors.shape[0]
+        self.StateShape = (
+            self.observation_planes.shape[0]
+            + self.observation_missiles.shape[0]
+            + self.observation_interceptors.shape[0]
+        )
         self.D0 = np.empty((missilesNum,), dtype=np.float32)
 
         for i in range(missilesNum):
-            self.D0[i] = CalDistance([self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
-                                     [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z])
+            self.D0[i] = CalDistance(
+                [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
+                [self.missileList[i].X, self.missileList[i].Y, self.missileList[i].Z],
+            )
         self.t = 0
-        state = np.concatenate((self.observation_planes, self.observation_missiles, self.observation_interceptors))
+        self.lanchTime = 0
+        self.spaceSize = spaceSize
+        self.max_steps = max(1, int(spaceSize))
 
-        # 无量纲化
-        state = self.normalizeState(state, reverse=False)
-        state = self._get_flattenstate(state)
         state = self._genNewState_()
-        return state, self.escapeFlag, info
+        return state, self.escapeFlag.value, self._build_info()
 
     # 无量纲化
     '''reverse为TRUE时 量钢化'''
@@ -901,29 +672,32 @@ class ManeuverEnv:
 
 
     """发射策略"""
-    def LanchPolicy(self, interceptor_goal):
-        # 两次发射间隔步数
-        if abs(self.t - self.lanchTime) >= LanchGap:
-            # 目标没锁满
-                    if self.LockConstraint(interceptor_goal):
-                        for i in range(self.interceptorNum):
-                            # 待发射的导弹
-                            if self.interceptorList[i].T_i == -1:
-                                interceptor = self.interceptorList[i]
-                                interceptor.sync_with_aircraft(
-                                    [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
-                                    self.aircraftList.Pitch,
-                                    self.aircraftList.Heading,
-                                    self.aircraftList.V,
-                                )
-                                launch_speed = max(self.aircraftList.V, self.interceptorSpeed)
-                                interceptor.begin_pursuit(interceptor_goal, launch_speed)
-                                self.interceptor_remain -= 1
-                                self.lanchTime = self.t
-                                return True
-
-        else:
+    def LanchPolicy(self, interceptor_goal: int) -> bool:
+        if interceptor_goal < 0 or interceptor_goal >= self.missileNum:
             return False
+        if self.interceptor_remain <= 0:
+            return False
+        if (self.t - self.lanchTime) < self.launch_gap:
+            return False
+        if not self.LockConstraint(interceptor_goal):
+            return False
+
+        for interceptor in self.interceptorList:
+            if interceptor.T_i != -1:
+                continue
+            interceptor.sync_with_aircraft(
+                [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
+                self.aircraftList.Pitch,
+                self.aircraftList.Heading,
+                self.aircraftList.V,
+            )
+            launch_speed = max(self.aircraftList.V, self.interceptorSpeed)
+            interceptor.begin_pursuit(interceptor_goal, launch_speed)
+            self.interceptor_remain -= 1
+            self.lanchTime = self.t
+            return True
+
+        return False
 
 
 
