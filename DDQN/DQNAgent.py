@@ -44,7 +44,7 @@ class MyDQNAgent:
         self.gamma = float(gamma if gamma is not None else 0.99)
         self.lr = float(lr if lr is not None else 1e-4)
         self.tau = float(np.clip(target_update_tau, 0.0, 1.0))
-        self.mse_loss = nn.MSELoss(reduction='mean')
+        self.loss_fn = nn.SmoothL1Loss(reduction='mean')
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-8)
 
     def _update_target_model(self):
@@ -128,7 +128,7 @@ class MyDQNAgent:
             target = reward + (1.0 - done) * self.gamma * max_next_q
 
         # 4. TD 误差
-        loss = self.mse_loss(pred_value, target)
+        loss = self.loss_fn(pred_value, target)
 
         # 5. 更新DQN的参数
         # 梯度清零
