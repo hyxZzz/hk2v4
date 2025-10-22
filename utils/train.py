@@ -39,7 +39,7 @@ def run_train_episode(agent, env, rpmemory, MEMORY_WARMUP_SIZE, LEARN_FREQ, BATC
         next_state, reward, done, info = env.step(action)
         attribution = info.get("attribution_bonus")
         if attribution is None:
-            attribution = np.zeros(Env.num_planes, dtype=np.float32)
+            attribution = np.zeros(env.num_planes, dtype=np.float32)
         rpmemory.add((state, action, reward, next_state, done, attribution))
 
         # 当经验回放数组中的经验数量足够多时（大于给定阈值，手动设定），每50个时间步训练一次

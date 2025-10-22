@@ -10,7 +10,13 @@ from gym import spaces
 from Environment.ActionDepository import getActionDepository
 from Environment.reset_env import reset_para
 from flat_models.ThreatEvaluate import CalTreat
-from flat_models.trajectory import Aircraft, Interceptor, Missiles
+from flat_models.trajectory import (
+    Aircraft,
+    Interceptor,
+    Missiles,
+    MaxInterceptorDist,
+    MinInterceptorDist,
+)
 from utils.common import CalDistance
 
 act_num = 29
@@ -28,15 +34,23 @@ PLANE_SAFE_ALTITUDE = (8000.0, 12000.0)
 POSITION_SCALE = 25000.0
 ANGLE_SCALE = m.pi
 VELOCITY_SCALE = 1000.0
-TEAM_REWARD_WEIGHTS = dict(intercept=2.0, survival=1.0, safety=0.5)
+TEAM_REWARD_WEIGHTS = dict(intercept=3.0, remaining=-2.0)
+SUCCESS_COMPLETION_BONUS = 5.0
+TIMEOUT_PENALTY = 4.0
+LOSS_PENALTY = 6.0
+ACTIVE_MISSILE_STEP_PENALTY = 0.5
 ATTRIBUTION_BONUS = 0.1
 DANGER_DISTANCE = 3000.0
-DANGER_HOLD_PENALTY = 0.6
-RESPONSIVE_LAUNCH_BONUS = 0.4
-PREMATURE_LAUNCH_PENALTY = 0.2
-INVALID_TARGET_PENALTY = 0.15
-CONSTRAINT_FAILURE_PENALTY = 0.1
+DANGER_HOLD_PENALTY = 0.8
+RESPONSIVE_LAUNCH_BONUS = 0.3
+PREMATURE_LAUNCH_PENALTY = 0.5
+INVALID_TARGET_PENALTY = 0.6
+CONSTRAINT_FAILURE_PENALTY = 0.6
 MAX_PREMATURE_DISTANCE = DANGER_DISTANCE * 3.0
+WITHIN_RANGE_LAUNCH_BONUS = 0.35
+OUT_OF_RANGE_LAUNCH_PENALTY = 0.7
+MIN_INTERCEPT_DISTANCE = float(MinInterceptorDist)
+MAX_INTERCEPT_DISTANCE = float(MaxInterceptorDist)
 LanchGap = 70
 
 
@@ -295,6 +309,7 @@ class ManeuverEnv:
             meta["danger_zone"] = (
                 meta["nearest_distance"] is not None and meta["nearest_distance"] < DANGER_DISTANCE
             )
+            meta["range_invalid"] = False
 
             action = self.action_dep[action_idx]
             nx, ny, roll, pitch_constraint = action[:4]
@@ -314,8 +329,16 @@ class ManeuverEnv:
                         self.missileList[target_cmd].Z,
                     ],
                 )
+                if not aircraft.LimitCondition(
+                    [
+                        self.missileList[target_cmd].X,
+                        self.missileList[target_cmd].Y,
+                        self.missileList[target_cmd].Z,
+                    ]
+                ):
+                    meta["range_invalid"] = True
                 launch = self._attempt_launch(plane_id, target_cmd, meta)
-                if not launch:
+                if not launch and not meta.get("range_invalid", False):
                     self._prepare_lock_only(plane_id, target_cmd)
             else:
                 if target_cmd >= 0:
@@ -355,13 +378,24 @@ class ManeuverEnv:
             if meta is not None:
                 meta["constraint_failed"] = True
             return False
+        missile = self.missileList[target_id]
+        plane = self.aircraftList[plane_id]
+        target_pos = [missile.X, missile.Y, missile.Z]
+        if not plane.LimitCondition(target_pos):
+            if meta is not None:
+                meta["constraint_failed"] = True
+                meta["range_invalid"] = True
+                if meta.get("target_distance") is None:
+                    meta["target_distance"] = CalDistance(
+                        [plane.X, plane.Y, plane.Z], target_pos
+                    )
+            return False
         allocated = self._allocate_interceptor(plane_id)
         if allocated is None:
             if meta is not None:
                 meta["constraint_failed"] = True
             return False
         interceptor = self.interceptorList[allocated]
-        plane = self.aircraftList[plane_id]
         interceptor.sync_with_aircraft([plane.X, plane.Y, plane.Z], plane.Pitch, plane.Heading, plane.V)
         launch_speed = max(plane.V, self.interceptorSpeed)
         interceptor.begin_pursuit(target_id, launch_speed, plane_id, float(self.t))
@@ -472,11 +506,9 @@ class ManeuverEnv:
     # Reward computation
     # ------------------------------------------------------------------
     def _compute_reward(self) -> float:
-        intercepts = sum(1 for missile in self.missileList if not missile.attacking)
-        intercept_ratio = intercepts / max(1, self.missileNum)
-        survival = 1.0 if self.escapeFlag == 2 else (0.0 if self.escapeFlag == 0 else 0.5)
-        safety = self._mean_missile_distance()
-        safety = min(safety / DANGER_DISTANCE, 1.0)
+        active_missiles = sum(1 for missile in self.missileList if missile.attacking)
+        remaining_ratio = active_missiles / max(1, self.missileNum)
+        intercept_ratio = 1.0 - remaining_ratio
         threat = 0.0
         for missile in self.missileList:
             if not missile.attacking:
@@ -488,11 +520,17 @@ class ManeuverEnv:
             threat = max(threat, CalTreat(plane_state, missile_state, plane.V, missile.V))
         threat_penalty = min(threat / 100.0, 1.0)
 
-        reward = (
-            TEAM_REWARD_WEIGHTS["intercept"] * intercept_ratio
-            + TEAM_REWARD_WEIGHTS["survival"] * survival
-            + TEAM_REWARD_WEIGHTS["safety"] * safety
-        )
+        reward = TEAM_REWARD_WEIGHTS["intercept"] * intercept_ratio
+        reward += TEAM_REWARD_WEIGHTS["remaining"] * remaining_ratio
+        reward -= ACTIVE_MISSILE_STEP_PENALTY * remaining_ratio
+
+        if self.escapeFlag == 2:
+            reward += SUCCESS_COMPLETION_BONUS
+        elif self.escapeFlag == 1:
+            reward -= TIMEOUT_PENALTY
+        elif self.escapeFlag == 0:
+            reward -= LOSS_PENALTY
+
         reward -= 0.3 * threat_penalty
         reward += float(np.sum(self.attribution_bonus))
         reward += self._launch_shaping_reward()
@@ -502,29 +540,67 @@ class ManeuverEnv:
     def _launch_shaping_reward(self) -> float:
         shaping_reward = 0.0
         penalties = 0.0
-        for meta in self._step_metadata:
-            nearest = meta.get("nearest_distance")
-            target_distance = meta.get("target_distance")
+        for plane_id, meta in enumerate(self._step_metadata):
+            nearest = self._nearest_active_missile_distance(plane_id)
+            if nearest is None:
+                nearest = meta.get("nearest_distance")
+            else:
+                meta["nearest_distance"] = nearest
+
+            target_idx = meta.get("target", -1)
+            target_distance = None
+            if 0 <= target_idx < len(self.missileList):
+                missile = self.missileList[target_idx]
+                if missile.attacking:
+                    plane = self.aircraftList[plane_id]
+                    target_distance = CalDistance(
+                        [plane.X, plane.Y, plane.Z],
+                        [missile.X, missile.Y, missile.Z],
+                    )
+            if target_distance is None:
+                target_distance = meta.get("target_distance")
+            else:
+                meta["target_distance"] = target_distance
+
+            danger_zone = nearest is not None and nearest < DANGER_DISTANCE
+            meta["danger_zone"] = danger_zone
             launch = bool(meta.get("launch"))
-            danger_zone = bool(meta.get("danger_zone"))
+            range_invalid = bool(meta.get("range_invalid"))
+            invalid_target = bool(meta.get("invalid_target"))
+            constraint_failed = bool(meta.get("constraint_failed"))
+
             if danger_zone:
                 if launch and target_distance is not None:
                     ratio = 1.0 - min(target_distance, DANGER_DISTANCE) / DANGER_DISTANCE
-                    shaping_reward += RESPONSIVE_LAUNCH_BONUS * ratio
+                    shaping_reward += RESPONSIVE_LAUNCH_BONUS * max(ratio, 0.0)
                 elif not launch and nearest is not None:
                     ratio = 1.0 - min(nearest, DANGER_DISTANCE) / DANGER_DISTANCE
-                    penalties += DANGER_HOLD_PENALTY * ratio
+                    penalties += DANGER_HOLD_PENALTY * max(ratio, 0.0)
             else:
                 if launch:
                     far_distance = target_distance if target_distance is not None else nearest
                     if far_distance is None:
                         far_distance = MAX_PREMATURE_DISTANCE
                     excess = max(0.0, far_distance - DANGER_DISTANCE)
-                    penalties += PREMATURE_LAUNCH_PENALTY * min(excess / max(1.0, MAX_PREMATURE_DISTANCE - DANGER_DISTANCE), 1.0)
+                    penalties += PREMATURE_LAUNCH_PENALTY * min(
+                        excess / max(1.0, MAX_PREMATURE_DISTANCE - DANGER_DISTANCE),
+                        1.0,
+                    )
 
-            if meta.get("invalid_target"):
+            if launch and not range_invalid and target_distance is not None:
+                within_span = MAX_INTERCEPT_DISTANCE - MIN_INTERCEPT_DISTANCE
+                if within_span > 0:
+                    clipped = min(max(target_distance - MIN_INTERCEPT_DISTANCE, 0.0), within_span)
+                    ratio = 1.0 - clipped / within_span
+                else:
+                    ratio = 1.0
+                shaping_reward += WITHIN_RANGE_LAUNCH_BONUS * max(ratio, 0.0)
+            if launch and range_invalid:
+                penalties += OUT_OF_RANGE_LAUNCH_PENALTY
+
+            if invalid_target:
                 penalties += INVALID_TARGET_PENALTY
-            if meta.get("constraint_failed"):
+            if constraint_failed:
                 penalties += CONSTRAINT_FAILURE_PENALTY
 
         return shaping_reward - penalties
@@ -656,5 +732,6 @@ class ManeuverEnv:
             "target_distance": None,
             "nearest_distance": None,
             "danger_zone": False,
+            "range_invalid": False,
         }
 
