@@ -23,10 +23,14 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 import torch
 
-from DDQN.DDQN import Double_DQN
-from DDQN.DQNAgent import MyDQNAgent, device as agent_device
-
+from DDQN.DQNAgent import MyDQNAgent
 from Environment.init_env import init_env
+from utils.validate import (
+    EvaluationConfig,
+    build_agent as build_evaluation_agent,
+    load_checkpoint as load_evaluation_checkpoint,
+    select_action as select_policy_action,
+)
 
 # 环境完成标志与说明文本映射
 DONE_MESSAGES = {
@@ -49,7 +53,7 @@ class FrameData:
 
 
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
+    """解析命令行参数，并忽略训练脚本专有的多余选项。"""
 
     parser = argparse.ArgumentParser(description="生成空战场景的三维轨迹 GIF")
     parser.add_argument(
@@ -118,7 +122,14 @@ def parse_args() -> argparse.Namespace:
         default=5e-4,
         help="训练时采用的学习率（默认：5e-4）",
     )
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(
+            "警告：检测到以下未使用的参数 {}，已忽略。该脚本仅需加载权重并执行可视化。".format(
+                " ".join(unknown)
+            )
+        )
+    return args
 
 
 def capture_frame(env) -> FrameData:
@@ -149,37 +160,16 @@ def build_agent(env, gamma: float, learning_rate: float) -> MyDQNAgent:
 
     action_size = env._get_actSpace()
     state_size = env._getNewStateSpace()[0]
-    model = Double_DQN(state_size=state_size, action_size_each=action_size, num_agents=env.num_planes)
-    agent = MyDQNAgent(
-        model,
-        action_size,
-        num_agents=env.num_planes,
+    config = EvaluationConfig(
+        episodes=1,
+        num_missiles=env.missilesNum,
+        num_planes=env.num_planes,
+        step_num=env.spaceSize,
         gamma=gamma,
-        lr=learning_rate,
-        e_greed=0.0,
-        e_greed_decrement=0.0,
+        learning_rate=learning_rate,
     )
-    agent.model.eval()
-    agent.target_model.eval()
+    agent = build_evaluation_agent(state_size, action_size, env.num_planes, config)
     return agent
-
-
-def load_checkpoint(agent: MyDQNAgent, checkpoint_path: Path) -> None:
-    """从指定路径读取训练权重并加载至智能体。"""
-
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"未找到模型权重文件：{checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location=agent_device)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    agent.model.load_state_dict(state)
-    agent.target_model.load_state_dict(agent.model.state_dict())
-
-
-def select_actions(agent: MyDQNAgent, state: Sequence) -> Sequence[int]:
-    """使用训练得到的策略输出当前状态下的多智能体动作。"""
-
-    return agent.predict(state)
 
 
 def simulate_episode(
@@ -195,7 +185,7 @@ def simulate_episode(
     step_count = 0
 
     for _ in range(max_steps):
-        actions = select_actions(agent, state)
+        actions = select_policy_action(agent, state)
         state, reward, done_flag, _ = env.step(actions)
         frames.append(capture_frame(env))
         total_reward += float(reward)
@@ -397,7 +387,9 @@ def main() -> None:
     )
 
     agent = build_agent(env, gamma=args.gamma, learning_rate=args.learning_rate)
-    load_checkpoint(agent, args.checkpoint)
+    if not args.checkpoint.is_file():
+        raise FileNotFoundError(f"未找到模型权重文件：{args.checkpoint}")
+    load_evaluation_checkpoint(agent, str(args.checkpoint))
 
     max_steps = max(1, min(args.max_steps, env.spaceSize))
 
