@@ -1,8 +1,11 @@
-import math as m
-import numpy as np
 import copy
+import math as m
+from typing import Dict
 
-actionDict = {
+import numpy as np
+
+
+actionDict: Dict[str, list] = {
     '0': [0, 1, 0, 0],  # 匀速前飞 不打导弹 0 1 2
     '1': [2, 1, 0, 0],  # 加速前飞 不打导弹 3 4 5
     '2': [4, 1, 0, 0],  # 加速前飞 不打导弹 6 7 8
@@ -35,25 +38,24 @@ actionDict = {
 }
 
 
-def getActionDepository(missile_num, act_num=29):
-    ActionDepository = np.empty((act_num * (missile_num + 1), 5), dtype=np.float32)
+def getActionDepository(missile_num: int, act_num: int = 29) -> np.ndarray:
+    """生成包含导弹指派维度的动作库，第五列为目标编号（-1 表示不发射）。"""
 
+    action_matrix = np.empty((act_num * (missile_num + 1), 5), dtype=np.float32)
     t = 0
     for i in range(act_num):
         for j in range(-1, missile_num):
             act = copy.deepcopy(actionDict[str(i)])
-            act.extend([j])
-            ActionDepository[t] = act
+            act.append(j)
+            action_matrix[t] = act
             t += 1
-    # print(ActionDepository)
-    return ActionDepository
-
-def getNewActionDepository(act_num=29):
-    ActionDepository = np.empty((act_num, 4), dtype=np.float32)
+    return action_matrix
 
 
+def getNewActionDepository(act_num: int = 29) -> np.ndarray:
+    """保留旧接口，仅返回纯机动动作（无目标编号）。"""
+
+    action_matrix = np.empty((act_num, 4), dtype=np.float32)
     for i in range(act_num):
-        act = actionDict[str(i)]
-        ActionDepository[i] = act
-    # print(ActionDepository)
-    return ActionDepository
+        action_matrix[i] = actionDict[str(i)]
+    return action_matrix
