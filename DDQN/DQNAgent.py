@@ -8,13 +8,16 @@ import torch.optim as optim
 # Determine if CPU or GPU computation should be used
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# 更新目标网络的操作函数，在MyDQNAgent.learn()函数中调用
-def soft_update(target, source, tau=0):
-    # zip() 函数用于将可迭代的对象作为参数，将对象中对应的元素打包成一个个元组，然后返回由这些元组组成的列表。
-    # print(target.parameters())
-    target.load_state_dict(source.state_dict())
-    # print(target.parameters())
-        # target_param.set_para(target_param*tau+param*(1.0-tau))
+
+def soft_update(target: nn.Module, source: nn.Module, tau: float = 1.0) -> None:
+    tau = float(np.clip(tau, 0.0, 1.0))
+    if tau >= 1.0:
+        target.load_state_dict(source.state_dict())
+        return
+
+    with torch.no_grad():
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.mul_(1.0 - tau).add_(tau * param.data)
 
 
 class MyDQNAgent:
@@ -28,6 +31,7 @@ class MyDQNAgent:
         e_greed=0.1,
         e_greed_decrement=0,
         update_target_steps=15,
+        target_update_tau=1.0,
     ):
 
         self.action_size = action_size
@@ -37,13 +41,14 @@ class MyDQNAgent:
         self.e_greed_decrement = e_greed_decrement  # ϵ的动态更新因子
         self.model = model.to(device)
         self.target_model = copy.deepcopy(model).to(device)
-        self.gamma = gamma  # 回报折扣因子
-        self.lr = lr
+        self.gamma = float(gamma if gamma is not None else 0.99)
+        self.lr = float(lr if lr is not None else 1e-4)
+        self.tau = float(np.clip(target_update_tau, 0.0, 1.0))
         self.mse_loss = nn.MSELoss(reduction='mean')
-        self.optimizer = optim.Adam(lr=lr, params=self.model.parameters())
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-8)
 
     def _update_target_model(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        soft_update(self.target_model, self.model, self.tau)
 
     # 使用行为策略生成动作
     def sample(self, state):
@@ -130,6 +135,7 @@ class MyDQNAgent:
         self.optimizer.zero_grad()
         # 反向计算梯度
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
         # 梯度更新
         self.optimizer.step()
 
