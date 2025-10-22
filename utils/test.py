@@ -69,12 +69,14 @@ def evaluate_on_shared_env(
         env, _, _ = init_env(
             num_missiles=config.num_missiles,
             StepNum=config.step_num,
+            num_planes=config.num_planes,
+            interceptor_num=12,
         )
 
         action_size = env._get_actSpace()
         state_size = env._getNewStateSpace()[0]
 
-        agent = build_agent(state_size, action_size, config)
+        agent = build_agent(state_size, action_size, env.num_planes, config)
         load_checkpoint(agent, checkpoint_path)
 
         successes = 0
@@ -147,6 +149,12 @@ def parse_args() -> argparse.Namespace:
         help="每个 episode 的最大步数",
     )
     parser.add_argument(
+        "--num-planes",
+        type=int,
+        default=EvaluationConfig.num_planes,
+        help="评估时的载机数量",
+    )
+    parser.add_argument(
         "--gamma",
         type=float,
         default=EvaluationConfig.gamma,
@@ -172,6 +180,7 @@ def main() -> None:
     config = EvaluationConfig(
         episodes=args.episodes,
         num_missiles=args.num_missiles,
+        num_planes=args.num_planes,
         step_num=args.step_num,
         gamma=args.gamma,
         learning_rate=args.learning_rate,
