@@ -37,6 +37,7 @@ def run_train_episode(
     memory_warmup_size: int,
     learn_freq: int,
     batch_size: int,
+    train_loops: int,
 ):
     num_agents = len(agents)
     total_rewards = np.zeros(num_agents, dtype=np.float32)
@@ -61,18 +62,21 @@ def run_train_episode(
         )
 
         if can_learn:
-            for idx, agent in enumerate(agents):
-                shared_buffer = shared_buffers[agent_action_sizes[idx]]
-                if shared_buffer.size() <= memory_warmup_size:
-                    continue
-                experiences = shared_buffer.sample(batch_size)
-                if not experiences:
-                    continue
-                batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
-                loss = agent.learn(
-                    batch_state, batch_action, batch_reward, batch_next_state, batch_done
-                )
-                train_losses[idx] = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
+            for _ in range(max(1, train_loops)):
+                for idx, agent in enumerate(agents):
+                    shared_buffer = shared_buffers[agent_action_sizes[idx]]
+                    if shared_buffer.size() <= memory_warmup_size:
+                        continue
+                    experiences = shared_buffer.sample(batch_size)
+                    if not experiences:
+                        continue
+                    batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(
+                        *experiences
+                    )
+                    loss = agent.learn(
+                        batch_state, batch_action, batch_reward, batch_next_state, batch_done
+                    )
+                    train_losses[idx] = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
 
         total_rewards += np.array(rewards, dtype=np.float32)
         states = next_states
@@ -150,7 +154,7 @@ def main():
     parser.add_argument('--memory_size', type=int, default=60000, help='Size of replay memory')
     parser.add_argument('--memory_warmup_size', type=int, default=4000, help='Warmup size of replay memory')
     parser.add_argument('--learn_freq', type=int, default=1, help='Frequency of learning updates')
-    parser.add_argument('--batch_size', type=int, default=384, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=512, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for training')
     parser.add_argument('--gamma', type=float, default=0.993, help='Discount factor')
     parser.add_argument(
@@ -158,6 +162,12 @@ def main():
         type=int,
         default=15,
         help='Number of learning steps between target network updates',
+    )
+    parser.add_argument(
+        '--train_loops',
+        type=int,
+        default=2,
+        help='Number of gradient updates per learning step to better utilize the GPU',
     )
     parser.add_argument('--max_episode', type=int, default=1000, help='Maximum number of episodes')
     parser.add_argument(
@@ -240,6 +250,7 @@ def main():
                 args.memory_warmup_size,
                 args.learn_freq,
                 args.batch_size,
+                args.train_loops,
             )
             mean_reward = float(np.mean(total_reward))
             mean_loss = float(np.mean(train_losses))

@@ -905,25 +905,24 @@ class ManeuverEnv:
         # 两次发射间隔步数
         if abs(self.t - self.lanchTime) >= LanchGap:
             # 目标没锁满
-                    if self.LockConstraint(interceptor_goal):
-                        for i in range(self.interceptorNum):
-                            # 待发射的导弹
-                            if self.interceptorList[i].T_i == -1:
-                                interceptor = self.interceptorList[i]
-                                interceptor.sync_with_aircraft(
-                                    [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
-                                    self.aircraftList.Pitch,
-                                    self.aircraftList.Heading,
-                                    self.aircraftList.V,
-                                )
-                                launch_speed = max(self.aircraftList.V, self.interceptorSpeed)
-                                interceptor.begin_pursuit(interceptor_goal, launch_speed)
-                                self.interceptor_remain -= 1
-                                self.lanchTime = self.t
-                                return True
+            if self.LockConstraint(interceptor_goal):
+                for i in range(self.interceptorNum):
+                    # 待发射的导弹
+                    if self.interceptorList[i].T_i == -1:
+                        interceptor = self.interceptorList[i]
+                        interceptor.sync_with_aircraft(
+                            [self.aircraftList.X, self.aircraftList.Y, self.aircraftList.Z],
+                            self.aircraftList.Pitch,
+                            self.aircraftList.Heading,
+                            self.aircraftList.V,
+                        )
+                        launch_speed = max(self.aircraftList.V, self.interceptorSpeed)
+                        interceptor.begin_pursuit(interceptor_goal, launch_speed)
+                        self.interceptor_remain -= 1
+                        self.lanchTime = self.t
+                        return True
 
-        else:
-            return False
+        return False
 
 
 
