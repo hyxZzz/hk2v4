@@ -1,13 +1,3 @@
-"""Validation script for evaluating DDQN checkpoints.
-
-This module scans the ``models`` directory for checkpoint files named
-``DDQN_episodeXXX.pth`` (starting from episode 100), evaluates each checkpoint
-for a fixed number of episodes, and logs the intercept success rate to
-``runs/val`` using TensorBoard summaries as well as a CSV file for convenience.
-"""
-
-from __future__ import annotations
-
 import argparse
 import os
 import re
@@ -32,23 +22,15 @@ class EvaluationConfig:
     step_num: int = 3500
     gamma: float = 0.993
     learning_rate: float = 5e-4
+    num_aircraft: int = 1
+    interceptors_per_plane: int = 6
 
 
-EPISODE_PATTERN = re.compile(r"DDQN_episode(\d+)\.pth$")
+EPISODE_PATTERN = re.compile(r"DDQN_episode(\d+)\.pth$|DDQN_multi_episode(\d+)\.pth$")
 
 
 def collect_checkpoints(model_root: str, start_episode: int) -> List[Tuple[int, str]]:
-    """Return a sorted list of checkpoint paths and their episode numbers.
-
-    Args:
-        model_root: Root directory that potentially contains checkpoint files.
-        start_episode: Minimum episode index (inclusive) that a checkpoint must
-            have to be considered.
-
-    Returns:
-        A list of tuples ``(episode, path)`` sorted by ``episode`` in ascending
-        order.
-    """
+    """Return a sorted list of checkpoint paths and their episode numbers."""
 
     checkpoints: List[Tuple[int, str]] = []
     if not os.path.isdir(model_root):
@@ -59,7 +41,10 @@ def collect_checkpoints(model_root: str, start_episode: int) -> List[Tuple[int, 
             match = EPISODE_PATTERN.search(filename)
             if not match:
                 continue
-            episode = int(match.group(1))
+            episode_candidates = [int(group) for group in match.groups() if group]
+            if not episode_candidates:
+                continue
+            episode = episode_candidates[0]
             if episode < start_episode:
                 continue
             checkpoints.append((episode, os.path.join(root, filename)))
@@ -68,36 +53,46 @@ def collect_checkpoints(model_root: str, start_episode: int) -> List[Tuple[int, 
     return checkpoints
 
 
-def build_agent(state_size: int, action_size: int, config: EvaluationConfig) -> MyDQNAgent:
-    """Construct a ``MyDQNAgent`` ready for evaluation."""
+def build_agents(state_size: int, action_sizes: Sequence[int], config: EvaluationConfig) -> List[MyDQNAgent]:
+    agents: List[MyDQNAgent] = []
+    for action_size in action_sizes:
+        model = Double_DQN(state_size=state_size, action_size=action_size)
+        agent = MyDQNAgent(
+            model,
+            action_size,
+            gamma=config.gamma,
+            lr=config.learning_rate,
+            e_greed=0.0,
+            e_greed_decrement=0.0,
+        )
+        agent.model.eval()
+        agent.target_model.eval()
+        agents.append(agent)
+    return agents
 
-    model = Double_DQN(state_size=state_size, action_size=action_size)
-    agent = MyDQNAgent(
-        model,
-        action_size,
-        gamma=config.gamma,
-        lr=config.learning_rate,
-        e_greed=0.0,
-        e_greed_decrement=0.0,
-    )
-    agent.model.eval()
-    agent.target_model.eval()
-    return agent
 
-
-def load_checkpoint(agent: MyDQNAgent, checkpoint_path: str) -> None:
-    """Load model parameters from ``checkpoint_path`` into ``agent``."""
-
+def load_checkpoint(agents: Sequence[MyDQNAgent], checkpoint_path: str) -> None:
     state = torch.load(checkpoint_path, map_location=agent_device)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    agent.model.load_state_dict(state)
-    agent.target_model.load_state_dict(agent.model.state_dict())
+
+    if isinstance(state, dict):
+        loaded = False
+        for idx, agent in enumerate(agents):
+            key = f"model_agent_{idx}"
+            if key in state:
+                agent.model.load_state_dict(state[key])
+                agent.target_model.load_state_dict(agent.model.state_dict())
+                loaded = True
+        if loaded:
+            return
+        if "model" in state and len(agents) == 1:
+            state = state["model"]
+
+    for agent in agents:
+        agent.model.load_state_dict(state)
+        agent.target_model.load_state_dict(agent.model.state_dict())
 
 
 def select_action(agent: MyDQNAgent, state) -> int:
-    """Return the greedy action for ``state`` using ``agent``'s policy."""
-
     state_tensor = torch.tensor(state, dtype=torch.float32, device=agent_device)
     with torch.no_grad():
         q_values = agent.model(state_tensor)
@@ -108,13 +103,48 @@ def evaluate_checkpoint(
     checkpoint_path: str,
     config: EvaluationConfig,
 ) -> float:
-    """Evaluate ``checkpoint_path`` and return the intercept success rate."""
+    env, _, _ = init_env(
+        num_missiles=config.num_missiles,
+        StepNum=config.step_num,
+        num_aircraft=config.num_aircraft,
+        interceptors_per_plane=config.interceptors_per_plane,
+    )
 
-    env, _, _ = init_env(num_missiles=config.num_missiles, StepNum=config.step_num)
+    if hasattr(env, 'get_action_sizes'):
+        action_sizes = env.get_action_sizes()
+        state_size = env.get_observation_size()
+        agents = build_agents(state_size, action_sizes, config)
+
+        load_checkpoint(agents, checkpoint_path)
+        success_count = 0
+        for _ in range(config.episodes):
+            states, done_flag, _ = env.reset()
+            if isinstance(states, tuple):
+                states = states[0]
+            # Cooperative environment returns list of states per agent
+            if isinstance(states, list):
+                agent_states = states
+            else:
+                agent_states = [states for _ in agents]
+
+            while True:
+                actions = [select_action(agent, agent_states[idx]) for idx, agent in enumerate(agents)]
+                next_states, _, done_flag, _ = env.step(actions)
+                if isinstance(next_states, list):
+                    agent_states = next_states
+                else:
+                    agent_states = [next_states for _ in agents]
+                if done_flag != -1:
+                    if done_flag in (1, 2):
+                        success_count += 1
+                    break
+        return success_count / float(config.episodes)
+
+    # 兼容旧版单智能体环境
     action_size = env._get_actSpace()
     state_size = env._getNewStateSpace()[0]
-    agent = build_agent(state_size, action_size, config)
-    load_checkpoint(agent, checkpoint_path)
+    agent = build_agents(state_size, [action_size], config)[0]
+    load_checkpoint([agent], checkpoint_path)
 
     success_count = 0
     for _ in range(config.episodes):
@@ -131,8 +161,6 @@ def evaluate_checkpoint(
 
 
 def create_writer() -> Tuple[SummaryWriter, str]:
-    """Create a ``SummaryWriter`` under ``runs/val`` and return it and its path."""
-
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join("runs", "val", timestamp)
     os.makedirs(log_dir, exist_ok=True)
@@ -141,8 +169,6 @@ def create_writer() -> Tuple[SummaryWriter, str]:
 
 
 def save_csv(log_dir: str, results: Sequence[Tuple[int, str, float]]) -> str:
-    """Persist evaluation results as a CSV file and return its path."""
-
     csv_path = os.path.join(log_dir, "intercept_success_rates.csv")
     with open(csv_path, "w", encoding="utf-8") as csv_file:
         csv_file.write("episode,checkpoint,success_rate\n")
@@ -194,40 +220,50 @@ def parse_args() -> argparse.Namespace:
         default=EvaluationConfig.learning_rate,
         help="Learning rate placeholder required by the agent (default: 0.001)",
     )
+    parser.add_argument(
+        "--num-aircraft",
+        type=int,
+        default=EvaluationConfig.num_aircraft,
+        help="Number of defending aircraft in the scenario",
+    )
+    parser.add_argument(
+        "--interceptors-per-plane",
+        type=int,
+        default=EvaluationConfig.interceptors_per_plane,
+        help="Number of interceptors carried by each aircraft",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
     config = EvaluationConfig(
         episodes=args.episodes,
         num_missiles=args.num_missiles,
         step_num=args.step_num,
         gamma=args.gamma,
         learning_rate=args.learning_rate,
+        num_aircraft=args.num_aircraft,
+        interceptors_per_plane=args.interceptors_per_plane,
     )
 
     checkpoints = collect_checkpoints(args.model_root, args.start_episode)
     if not checkpoints:
-        raise FileNotFoundError(
-            f"No checkpoints matching 'DDQN_episode*.pth' (>= episode {args.start_episode}) "
-            f"were found under '{args.model_root}'."
-        )
+        print("No checkpoints found under", args.model_root)
+        return
 
     writer, log_dir = create_writer()
-    results: List[Tuple[int, str, float]] = []
+    results = []
+    for episode, path in checkpoints:
+        success_rate = evaluate_checkpoint(path, config)
+        writer.add_scalar('intercept_success_rate', success_rate, episode)
+        results.append((episode, path, success_rate))
+        print(f"Episode {episode}: success rate {success_rate:.4f}")
 
-    for episode, checkpoint_path in checkpoints:
-        success_rate = evaluate_checkpoint(checkpoint_path, config)
-        writer.add_scalar("intercept_success_rate", success_rate, global_step=episode)
-        results.append((episode, checkpoint_path, success_rate))
-        print(f"Episode {episode:>4} | success rate: {success_rate:.4f} | {checkpoint_path}")
-
-    writer.close()
     csv_path = save_csv(log_dir, results)
-    print(f"Validation complete. Results saved to {csv_path}")
+    print('Results saved to', csv_path)
 
 
 if __name__ == "__main__":
     main()
-
