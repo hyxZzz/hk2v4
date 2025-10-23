@@ -8,7 +8,7 @@ from flat_models.trajectory import Missiles, Aircraft, Interceptor
 from flat_models.ThreatEvaluate import CalTreat
 from utils.common import CalDistance
 from Environment.ActionDepository import getActionDepository, getNewActionDepository
-from Environment.reset_env import reset_para
+from Environment.reset_env import reset_para, reset_cooperative_para
 
 act_num = 29  # 机动动作的多少
 Gostep = 1  # 机动策略改变的频率
@@ -962,3 +962,324 @@ class ManeuverEnv:
 
         state = np.concatenate((missileDist, interceptorDist, missileStatus, interceptorStatus))
         return state
+
+
+class CooperativeManeuverEnv:
+    def __init__(
+        self,
+        missile_list: List[Missiles],
+        aircraft_list: List[Aircraft],
+        planeSpeed=170,
+        missilesNum=4,
+        spaceSize=5000,
+        missilesSpeed=680,
+        interceptors_per_plane=6,
+        interceptorSpeed=540,
+    ):
+        self.num_agents = len(aircraft_list)
+        if self.num_agents <= 0:
+            raise ValueError("至少需要一架飞机来构建协同环境")
+
+        self.action_space = [spaces.Discrete(getActionDepository(missilesNum, act_num).shape[0]) for _ in range(self.num_agents)]
+        self.spaceSize = spaceSize
+        self.missileNum = missilesNum
+        self.missileSpeed = missilesSpeed
+        self.interceptorSpeed = interceptorSpeed
+        self.interceptors_per_plane = interceptors_per_plane
+        self.position_scale = 25000.0
+        self.action_dep = getActionDepository(missilesNum, act_num)
+
+        self._build_from_state(missile_list, aircraft_list)
+
+    def _build_from_state(self, missile_list: List[Missiles], aircraft_list: List[Aircraft]):
+        self.missileList = missile_list
+        self.aircraftList = aircraft_list
+        self.interceptor_lists = []
+        self.interceptor_remain = []
+        self.lanchTime = [0 for _ in range(self.num_agents)]
+        self.t = 0
+        self.escapeFlag = -1
+
+        for plane in self.aircraftList:
+            plane_interceptors = []
+            for _ in range(self.interceptors_per_plane):
+                plane_interceptors.append(
+                    Interceptor([
+                        plane.X,
+                        plane.Y,
+                        plane.Z,
+                    ], plane.V, plane.Pitch, plane.Heading)
+                )
+            self.interceptor_lists.append(plane_interceptors)
+            self.interceptor_remain.append(self.interceptors_per_plane)
+
+        self._refresh_initial_distances()
+
+    def _refresh_initial_distances(self):
+        self.initial_distances = np.zeros((self.num_agents, len(self.missileList)), dtype=np.float32)
+        for plane_idx, plane in enumerate(self.aircraftList):
+            for missile_idx, missile in enumerate(self.missileList):
+                self.initial_distances[plane_idx, missile_idx] = CalDistance(
+                    [plane.X, plane.Y, plane.Z],
+                    [missile.X, missile.Y, missile.Z],
+                )
+
+    def _decode_action(self, agent_idx: int, action_index: int):
+        if action_index < 0 or action_index >= self.action_dep.shape[0]:
+            raise ValueError("非法动作索引")
+        nx, ny, roll, pitch_constraint, target_idx = self.action_dep[action_index]
+        return [nx, ny, roll, pitch_constraint], int(target_idx)
+
+    def _launch_constraint(self, agent_idx: int, target_idx: int) -> bool:
+        if target_idx < 0 or target_idx >= len(self.missileList):
+            return False
+        if not self.missileList[target_idx].attacking:
+            return False
+        if self.interceptor_remain[agent_idx] <= 0:
+            return False
+        if abs(self.t - self.lanchTime[agent_idx]) < LanchGap:
+            return False
+        active_count = sum(1 for interceptor in self.interceptor_lists[agent_idx] if interceptor.T_i == target_idx)
+        return active_count < max(1, self.interceptors_per_plane // max(1, self.missileNum))
+
+    def _launch_interceptor(self, agent_idx: int, target_idx: int) -> bool:
+        if not self._launch_constraint(agent_idx, target_idx):
+            return False
+
+        plane = self.aircraftList[agent_idx]
+        interceptors = self.interceptor_lists[agent_idx]
+        for interceptor in interceptors:
+            if interceptor.T_i == -1 and interceptor.attacking == -1:
+                interceptor.sync_with_aircraft(
+                    [plane.X, plane.Y, plane.Z],
+                    plane.Pitch,
+                    plane.Heading,
+                    plane.V,
+                )
+                launch_speed = max(plane.V, self.interceptorSpeed)
+                interceptor.begin_pursuit(target_idx, launch_speed)
+                self.interceptor_remain[agent_idx] -= 1
+                self.lanchTime[agent_idx] = self.t
+                return True
+        return False
+
+    def _update_idle_interceptors(self):
+        for idx, plane in enumerate(self.aircraftList):
+            for interceptor in self.interceptor_lists[idx]:
+                if interceptor.attacking == -1:
+                    interceptor.sync_with_aircraft(
+                        [plane.X, plane.Y, plane.Z], plane.Pitch, plane.Heading, plane.V
+                    )
+
+    def _update_interceptors(self, missile_positions):
+        intercept_success = 0
+        for agent_idx, interceptors in enumerate(self.interceptor_lists):
+            for interceptor in interceptors:
+                if interceptor.T_i == -1 or interceptor.attacking != 0:
+                    continue
+                target_idx = interceptor.T_i
+                missile = self.missileList[target_idx]
+                if not missile.attacking:
+                    interceptor.attacking = 1
+                    continue
+                mx, my, mz = missile_positions[target_idx]
+                ix, iy, iz = interceptor.InterceptorPosition(
+                    [mx, my, mz], missile.V, missile.Pitch, missile.Heading
+                )
+                if CalDistance([ix, iy, iz], [mx, my, mz]) < INTERCEPT_SUCCESS_DISTANCE:
+                    missile.attacking = False
+                    interceptor.attacking = 1
+                    intercept_success += 1
+        return intercept_success
+
+    def _compose_entities(self):
+        entities = []
+        for plane in self.aircraftList:
+            entities.append([
+                plane.X,
+                plane.Y,
+                plane.Z,
+                plane.Pitch,
+                plane.Heading,
+                plane.roll,
+            ])
+        for missile in self.missileList:
+            status = -1.0 if not missile.attacking else float(missile.target_id if missile.target_id is not None else 0)
+            entities.append([
+                missile.X,
+                missile.Y,
+                missile.Z,
+                missile.Pitch,
+                missile.Heading,
+                status,
+            ])
+        for interceptors in self.interceptor_lists:
+            for interceptor in interceptors:
+                entities.append([
+                    interceptor.X_i,
+                    interceptor.Y_i,
+                    interceptor.Z_i,
+                    interceptor.Pitch_i,
+                    interceptor.Heading_i,
+                    float(interceptor.attacking),
+                ])
+        return np.array(entities, dtype=np.float32)
+
+    def _normalize(self, state: np.ndarray) -> np.ndarray:
+        norm_state = state.copy()
+        if norm_state.size == 0:
+            return norm_state
+        norm_state[:, 0:3] = norm_state[:, 0:3] / self.position_scale
+        norm_state[:, 3:5] = norm_state[:, 3:5] / m.pi
+        norm_state[:, 5] = np.clip(norm_state[:, 5], -1.0, 1.0)
+        return norm_state
+
+    def _get_agent_observations(self):
+        entities = self._compose_entities()
+        norm_state = self._normalize(entities)
+        agent_states = []
+        plane_states = norm_state[: self.num_agents]
+        shared_tail = norm_state[self.num_agents :]
+        for idx in range(self.num_agents):
+            own = plane_states[idx : idx + 1]
+            others = np.concatenate(
+                [plane_states[:idx], plane_states[idx + 1 :]], axis=0
+            ) if self.num_agents > 1 else np.empty((0, plane_states.shape[1]), dtype=np.float32)
+            agent_matrix = np.concatenate((own, others, shared_tail), axis=0)
+            agent_states.append(agent_matrix.flatten())
+        return agent_states, norm_state
+
+    def get_observation_size(self) -> int:
+        agent_states, _ = self._get_agent_observations()
+        return agent_states[0].shape[0]
+
+    def get_action_sizes(self) -> List[int]:
+        return [space.n for space in self.action_space]
+
+    def reset(self):
+        missiles, aircrafts, _, missile_speed, _ = reset_cooperative_para(
+            num_aircraft=self.num_agents,
+            num_missiles=self.missileNum,
+            interceptors_per_plane=self.interceptors_per_plane,
+            StepNum=self.spaceSize,
+        )
+        if missile_speed:
+            self.missileSpeed = missile_speed
+        self._build_from_state(missiles, aircrafts)
+        self._update_idle_interceptors()
+        states, _ = self._get_agent_observations()
+        return states, self.escapeFlag, 'Go on Combating...'
+
+    def _distance_penalty(self):
+        penalty = 0.0
+        for missile in self.missileList:
+            if not missile.attacking:
+                continue
+            target_idx = missile.target_id if missile.target_id is not None else 0
+            plane = self.aircraftList[target_idx]
+            penalty += max(
+                0.0,
+                (DANGER_DISTANCE - CalDistance([plane.X, plane.Y, plane.Z], [missile.X, missile.Y, missile.Z])) / DANGER_DISTANCE,
+            )
+        return penalty
+
+    def _altitude_reward(self):
+        reward = 0.0
+        for plane in self.aircraftList:
+            reward += self._height_reward(plane.Y)
+        return reward / self.num_agents
+
+    def _height_reward(self, altitude: float) -> float:
+        safe_min = 8000.0
+        safe_max = 12000.0
+        tolerance = 1000.0
+        hard_min = safe_min - tolerance
+        hard_max = safe_max + tolerance
+        if altitude < hard_min or altitude > hard_max:
+            self.escapeFlag = 0
+            return -1.5
+        if altitude < safe_min:
+            ratio = (altitude - hard_min) / (safe_min - hard_min)
+            return -1.0 + 2.0 * ratio
+        if altitude > safe_max:
+            ratio = (hard_max - altitude) / (hard_max - safe_max)
+            return -1.0 + 2.0 * ratio
+        center = (safe_min + safe_max) / 2.0
+        span = (safe_max - safe_min) / 2.0
+        offset = (altitude - center) / span
+        return 1.0 - offset ** 2
+
+    def step(self, actions: List[int]):
+        if len(actions) != self.num_agents:
+            raise ValueError("动作数量需要与飞机数量一致")
+
+        decoded_actions = [self._decode_action(idx, act) for idx, act in enumerate(actions)]
+        info = 'Go on Combating...'
+        invalid_penalty = 0.0
+        launch_penalty = 0.0
+
+        for agent_idx, (control, target_idx) in enumerate(decoded_actions):
+            nx, ny, roll, pitch_constraint = control
+            plane = self.aircraftList[agent_idx]
+            valid = plane.action_constraint(pitch_constraint) and plane.speed_constraint(nx)
+            if valid:
+                plane.AircraftPostition(None, nx, ny, roll, pitch_constraint)
+            else:
+                invalid_penalty -= 0.2
+                plane.AircraftPostition(None, 0, 1, 0, 0)
+
+            if target_idx >= 0:
+                if not self._launch_interceptor(agent_idx, target_idx):
+                    launch_penalty -= 0.05
+
+        self._update_idle_interceptors()
+
+        missile_positions = []
+        plane_hit = False
+        for missile in self.missileList:
+            if not missile.attacking:
+                missile_positions.append([missile.X, missile.Y, missile.Z])
+                continue
+            target_idx = missile.target_id if missile.target_id is not None else 0
+            plane = self.aircraftList[target_idx]
+            mx, my, mz = missile.MissilePosition(
+                [plane.X, plane.Y, plane.Z], plane.V, plane.Pitch, plane.Heading
+            )
+            missile_positions.append([mx, my, mz])
+            if CalDistance([plane.X, plane.Y, plane.Z], [mx, my, mz]) < MISSILE_HIT_DISTANCE:
+                plane_hit = True
+                self.escapeFlag = 0
+                info = 'Hit on! Escape Fail!!'
+
+        intercept_success = self._update_interceptors(missile_positions)
+
+        active_missiles = sum(1 for missile in self.missileList if missile.attacking)
+        if active_missiles == 0 and self.escapeFlag == -1:
+            self.escapeFlag = 2
+            info = 'Intercept Success'
+
+        self.t += 1
+        if self.escapeFlag == -1 and self.t >= self.spaceSize:
+            self.escapeFlag = 1
+            info = 'Maneuver Success'
+
+        if plane_hit:
+            self.escapeFlag = 0
+
+        distance_penalty = self._distance_penalty()
+        altitude_reward = self._altitude_reward()
+
+        reward = -0.4 * distance_penalty + 1.2 * intercept_success + altitude_reward
+        reward += invalid_penalty + launch_penalty
+
+        if self.escapeFlag == 0:
+            reward -= 2.0
+        elif self.escapeFlag == 1:
+            reward += 1.5
+        elif self.escapeFlag == 2:
+            reward += 2.0
+
+        states, _ = self._get_agent_observations()
+        rewards = [reward for _ in range(self.num_agents)]
+        return states, rewards, self.escapeFlag, info
+
