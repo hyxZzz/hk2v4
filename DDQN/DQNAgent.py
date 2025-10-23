@@ -27,6 +27,7 @@ class MyDQNAgent:
         lr=None,
         e_greed=0.1,
         e_greed_decrement=0,
+        min_epsilon=0.1,
         update_target_steps=15,
     ):
 
@@ -35,6 +36,7 @@ class MyDQNAgent:
         self.update_target_steps = max(1, int(update_target_steps))
         self.e_greed = e_greed  # ϵ-greedy中的ϵ
         self.e_greed_decrement = e_greed_decrement  # ϵ的动态更新因子
+        self.min_epsilon = min_epsilon
         self.model = model.to(device)
         self.target_model = copy.deepcopy(model).to(device)
         self.gamma = gamma  # 回报折扣因子
@@ -52,13 +54,10 @@ class MyDQNAgent:
         if sample < self.e_greed:
             act = np.random.randint(self.action_size)  # 返回[0, action_size)的整数，这里就是0或1
         else:
-            if np.random.random() < 0.01:
-                act = np.random.randint(self.action_size)
-            else:
-                act = self.predict(state)
+            act = self.predict(state)
 
-        # 动态更改e_greed,但不小于0.1
-        self.e_greed = max(0.1, self.e_greed - self.e_greed_decrement)
+        # 动态更改e_greed,但不小于设定的最小值
+        self.e_greed = max(self.min_epsilon, self.e_greed - self.e_greed_decrement)
 
         return act
 

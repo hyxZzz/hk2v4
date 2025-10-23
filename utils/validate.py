@@ -135,7 +135,7 @@ def evaluate_checkpoint(
                 else:
                     agent_states = [next_states for _ in agents]
                 if done_flag != -1:
-                    if done_flag in (1, 2):
+                    if done_flag == 2:
                         success_count += 1
                     break
         return success_count / float(config.episodes)

@@ -1,7 +1,7 @@
 import argparse
 import time
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
@@ -32,6 +32,8 @@ def run_train_episode(
     agents: Sequence[MyDQNAgent],
     env,
     replay_buffers: Sequence[MyMemoryBuffer],
+    shared_buffers: Dict[int, MyMemoryBuffer],
+    agent_action_sizes: Sequence[int],
     memory_warmup_size: int,
     learn_freq: int,
     batch_size: int,
@@ -39,6 +41,7 @@ def run_train_episode(
     num_agents = len(agents)
     total_rewards = np.zeros(num_agents, dtype=np.float32)
     train_losses = [0.0 for _ in range(num_agents)]
+    unique_action_sizes = tuple(sorted(set(agent_action_sizes)))
 
     states, _, _ = env.reset()
     step = 0
@@ -49,13 +52,20 @@ def run_train_episode(
         next_states, rewards, done_flag, _ = env.step(actions)
 
         for idx in range(num_agents):
-            replay_buffers[idx].add(
-                (states[idx], actions[idx], rewards[idx], next_states[idx], done_flag)
-            )
+            experience = (states[idx], actions[idx], rewards[idx], next_states[idx], done_flag)
+            replay_buffers[idx].add(experience)
+            shared_buffers[agent_action_sizes[idx]].add(experience)
 
-        if step % learn_freq == 0 and all(buffer.size() > memory_warmup_size for buffer in replay_buffers):
+        can_learn = step % learn_freq == 0 and all(
+            shared_buffers[action_size].size() > memory_warmup_size for action_size in unique_action_sizes
+        )
+
+        if can_learn:
             for idx, agent in enumerate(agents):
-                experiences = replay_buffers[idx].sample(batch_size)
+                shared_buffer = shared_buffers[agent_action_sizes[idx]]
+                if shared_buffer.size() <= memory_warmup_size:
+                    continue
+                experiences = shared_buffer.sample(batch_size)
                 if not experiences:
                     continue
                 batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
@@ -80,7 +90,7 @@ def evaluate_agents(
 ) -> EvaluationMetrics:
     total_rewards: List[float] = []
     per_step_rewards: List[float] = []
-    successes = 0
+    intercept_successes = 0
 
     previous_states = []
     for agent in agents:
@@ -109,14 +119,14 @@ def evaluate_agents(
                 episode_reward += float(np.mean(rewards))
 
                 if done_flag != -1:
-                    if done_flag in (1, 2):
+                    if done_flag == 2:
                         success = True
                     break
 
             total_rewards.append(episode_reward)
             per_step_rewards.append(episode_reward / max(steps, 1))
             if success:
-                successes += 1
+                intercept_successes += 1
     finally:
         for agent, (model_mode, target_mode, epsilon) in zip(agents, previous_states):
             agent.model.train(model_mode)
@@ -125,7 +135,7 @@ def evaluate_agents(
 
     mean_total_reward = float(np.mean(total_rewards)) if total_rewards else 0.0
     mean_reward_per_step = float(np.mean(per_step_rewards)) if per_step_rewards else 0.0
-    success_rate = successes / float(eval_episodes) if eval_episodes > 0 else 0.0
+    success_rate = intercept_successes / float(eval_episodes) if eval_episodes > 0 else 0.0
 
     return EvaluationMetrics(
         mean_total_reward=mean_total_reward,
@@ -139,7 +149,7 @@ def main():
 
     parser.add_argument('--memory_size', type=int, default=60000, help='Size of replay memory')
     parser.add_argument('--memory_warmup_size', type=int, default=4000, help='Warmup size of replay memory')
-    parser.add_argument('--learn_freq', type=int, default=20, help='Frequency of learning updates')
+    parser.add_argument('--learn_freq', type=int, default=1, help='Frequency of learning updates')
     parser.add_argument('--batch_size', type=int, default=384, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for training')
     parser.add_argument('--gamma', type=float, default=0.993, help='Discount factor')
@@ -171,10 +181,20 @@ def main():
         interceptors_per_plane=interceptors_per_plane,
     )
 
-    action_sizes = env.get_action_sizes()
+    action_sizes = [int(size) for size in env.get_action_sizes()]
     state_size = env.get_observation_size()
 
     replay_buffers = [MyMemoryBuffer(args.memory_size) for _ in range(num_aircraft)]
+    shared_buffers = {
+        action_size: MyMemoryBuffer(args.memory_size) for action_size in set(action_sizes)
+    }
+
+    epsilon_start = 0.85
+    epsilon_end = 0.05
+    decay_ratio = 0.2
+    decay_target_episodes = max(1, int(args.max_episode * decay_ratio))
+    decay_steps = max(1, int(step_num * decay_target_episodes))
+    epsilon_decrement = (epsilon_start - epsilon_end) / decay_steps
 
     agents: List[MyDQNAgent] = []
     for action_size in action_sizes:
@@ -184,8 +204,9 @@ def main():
             action_size,
             gamma=args.gamma,
             lr=args.learning_rate,
-            e_greed=0.85,
-            e_greed_decrement=5e-7,
+            e_greed=epsilon_start,
+            e_greed_decrement=epsilon_decrement,
+            min_epsilon=epsilon_end,
             update_target_steps=args.target_update_freq,
         )
         agents.append(agent)
@@ -214,6 +235,8 @@ def main():
                 agents,
                 env,
                 replay_buffers,
+                shared_buffers,
+                action_sizes,
                 args.memory_warmup_size,
                 args.learn_freq,
                 args.batch_size,
@@ -230,9 +253,9 @@ def main():
             eval_metrics = evaluate_agents(agents, env, eval_episodes=args.validation_episodes)
             writer.add_scalar('eval/mean_total_reward', eval_metrics.mean_total_reward, episode)
             writer.add_scalar('eval/mean_reward_per_step', eval_metrics.mean_reward_per_step, episode)
-            writer.add_scalar('eval/success_rate', eval_metrics.success_rate, episode)
+            writer.add_scalar('eval/intercept_success_rate', eval_metrics.success_rate, episode)
             print(
-                'episode:{}    epsilon:{:.4f}   Eval reward:{:.4f}   Reward/step:{:.4f}   Success:{:.2%}'.format(
+                'episode:{}    epsilon:{:.4f}   Eval reward:{:.4f}   Reward/step:{:.4f}   Intercept Success:{:.2%}'.format(
                     episode,
                     float(np.mean([agent.e_greed for agent in agents])),
                     eval_metrics.mean_total_reward,

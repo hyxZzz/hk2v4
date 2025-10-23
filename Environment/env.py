@@ -1040,7 +1040,25 @@ class CooperativeManeuverEnv:
         if abs(self.t - self.lanchTime[agent_idx]) < LanchGap:
             return False
         active_count = sum(1 for interceptor in self.interceptor_lists[agent_idx] if interceptor.T_i == target_idx)
-        return active_count < max(1, self.interceptors_per_plane // max(1, self.missileNum))
+        missiles_attacking = sum(1 for missile in self.missileList if missile.attacking)
+        if missiles_attacking == 0:
+            missiles_attacking = 1
+
+        remaining_interceptors = self.interceptor_remain[agent_idx]
+        base_cap = max(1, int(m.ceil(self.interceptors_per_plane / missiles_attacking)))
+
+        plane = self.aircraftList[agent_idx]
+        missile = self.missileList[target_idx]
+        current_distance = CalDistance([plane.X, plane.Y, plane.Z], [missile.X, missile.Y, missile.Z])
+        initial_distance = self.initial_distances[agent_idx, target_idx]
+        distance_ratio = current_distance / initial_distance if initial_distance > 0 else 1.0
+
+        proximity_bonus = 0
+        if distance_ratio < 0.6 and remaining_interceptors > base_cap:
+            proximity_bonus = 1
+
+        dynamic_cap = max(1, min(remaining_interceptors, base_cap + proximity_bonus))
+        return active_count < dynamic_cap
 
     def _launch_interceptor(self, agent_idx: int, target_idx: int) -> bool:
         if not self._launch_constraint(agent_idx, target_idx):
