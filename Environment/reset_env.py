@@ -1,5 +1,6 @@
 import numpy as np
 import math as m
+
 from utils.common import ComputeHeading, ComputePitch
 from flat_models.trajectory import Aircraft, Missiles
 
@@ -71,4 +72,53 @@ def reset_para(num_missiles=3, StepNum=1200):
     # a_v = 340
 
     return missiles_list, aircraft_agent[0], a_v, num_missiles, StepNum, m_v
+
+
+def _create_aircraft():
+    a_x = np.random.uniform(-10000, 10000)
+    a_y = np.random.uniform(-10000, 10000)
+    a_z = np.random.uniform(8000, 12000)
+
+    a_v = np.random.uniform(0.5, 1.2) * 340
+    aPitch = 0.0
+    aHeading = np.random.uniform(-1, 1) * m.pi
+
+    return Aircraft([a_x, a_z, a_y], V=a_v, Pitch=aPitch, Heading=aHeading)
+
+
+def reset_cooperative_para(
+    num_aircraft: int = 2,
+    num_missiles: int = 4,
+    interceptors_per_plane: int = 6,
+    StepNum: int = 1200,
+):
+    aircraft_list = [_create_aircraft() for _ in range(num_aircraft)]
+
+    missiles_list = []
+    for i in range(num_missiles):
+        target_idx = i % num_aircraft
+        target_plane = aircraft_list[target_idx]
+
+        angles = np.random.uniform(0, 2 * m.pi)
+        radial_scale = np.random.uniform(0.85, 1.15)
+        major_axis = 20000.0
+        minor_axis = 15000.0
+
+        missile_x = target_plane.X + major_axis * radial_scale * np.cos(angles)
+        missile_y = target_plane.Z + minor_axis * radial_scale * np.sin(angles)
+        altitude_offset = np.random.uniform(-3000.0, 3000.0)
+        missile_z = np.clip(target_plane.Y + altitude_offset, 0.0, None)
+
+        position = [missile_x, missile_z, missile_y]
+        heading = ComputeHeading([target_plane.X, target_plane.Y, target_plane.Z], position)
+        pitch = ComputePitch([target_plane.X, target_plane.Y, target_plane.Z], position)
+
+        m_v = np.random.uniform(2, 3) * 340
+        missiles_list.append(
+            Missiles(position, V=m_v, Pitch=pitch, Heading=heading, target_id=target_idx)
+        )
+
+    missile_speed = np.mean([m.V for m in missiles_list]) if missiles_list else 0.0
+
+    return missiles_list, aircraft_list, StepNum, missile_speed, interceptors_per_plane
 

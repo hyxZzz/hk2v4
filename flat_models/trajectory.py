@@ -67,6 +67,7 @@ class Missiles:
         boost_duration: float = 5.0,
         speed_decay_interval: float = 1.0,
         speed_decay_factor: float = 0.99,
+        target_id: Optional[int] = None,
     ):
         self.X, self.Y, self.Z = missile_plist  # 导弹发射时位于的坐标
         self.V = V  # 导弹发射初速度
@@ -86,6 +87,7 @@ class Missiles:
         self.speed_decay_factor = speed_decay_factor
         self.initial_speed = V
         self.time = 0.0
+        self.target_id = target_id
         self._last_decay_time = boost_duration
 
     def _advance_time(self):
