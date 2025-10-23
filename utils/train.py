@@ -59,9 +59,10 @@ def run_train_episode(
                 if not experiences:
                     continue
                 batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*experiences)
-                train_losses[idx] = agent.learn(
+                loss = agent.learn(
                     batch_state, batch_action, batch_reward, batch_next_state, batch_done
                 )
+                train_losses[idx] = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
 
         total_rewards += np.array(rewards, dtype=np.float32)
         states = next_states
