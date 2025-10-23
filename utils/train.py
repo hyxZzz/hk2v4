@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -228,7 +229,12 @@ def main():
     parser.add_argument('--learn_freq', type=int, default=20, help='Frequency of learning')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for training')
-    parser.add_argument('--gamma', type=float, default=0.985, help='Discount factor')
+    parser.add_argument(
+        '--gamma',
+        type=float,
+        default=None,
+        help='Discount factor. If omitted a value matched to the episode length is used.',
+    )
     parser.add_argument(
         '--target_update_freq',
         type=int,
@@ -250,13 +256,21 @@ def main():
     LEARN_FREQ = args.learn_freq
     BATCH_SIZE = args.batch_size
     LEARNING_RATE = args.learning_rate
-    GAMMA = args.gamma
     TARGET_UPDATE_FREQ = args.target_update_freq
 
     start = time.time()
 
     num_missiles = 3
     step_num = 3500
+    if args.gamma is None:
+        # Ensure terminal rewards remain influential over the long horizon.
+        terminal_decay = 0.2
+        decay_target = max(min(terminal_decay, 0.99), 1e-3)
+        GAMMA = float(math.exp(math.log(decay_target) / max(step_num, 1)))
+        GAMMA = max(0.95, min(GAMMA, 0.9999))
+    else:
+        GAMMA = float(args.gamma)
+
     Env, aircraft, missiles = init_env(
         num_missiles=num_missiles,
         StepNum=step_num,

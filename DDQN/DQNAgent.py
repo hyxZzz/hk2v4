@@ -41,6 +41,7 @@ class MyDQNAgent:
         self.e_greed_decrement = e_greed_decrement  # ϵ的动态更新因子
         self.model = model.to(device)
         self.target_model = copy.deepcopy(model).to(device)
+        self.target_model.eval()
         self.gamma = float(gamma if gamma is not None else 0.99)
         self.lr = float(lr if lr is not None else 1e-4)
         self.tau = float(np.clip(target_update_tau, 0.0, 1.0))
@@ -120,12 +121,20 @@ class MyDQNAgent:
         pred_value = pred_values.gather(1, action)
 
         # target Q
-        with torch.no_grad():
-            next_q_online = self.model(next_state)
-            best_next_actions = next_q_online.argmax(dim=1, keepdim=True)
-            next_q_target = self.target_model(next_state)
+        current_model_training = self.model.training
+        target_model_training = self.target_model.training
+        try:
+            self.model.eval()
+            self.target_model.eval()
+            with torch.no_grad():
+                next_q_online = self.model(next_state)
+                best_next_actions = next_q_online.argmax(dim=1, keepdim=True)
+                next_q_target = self.target_model(next_state)
             max_next_q = next_q_target.gather(1, best_next_actions)
             target = reward + (1.0 - done) * self.gamma * max_next_q
+        finally:
+            self.model.train(current_model_training)
+            self.target_model.train(target_model_training)
 
         # 4. TD 误差
         loss = self.loss_fn(pred_value, target)

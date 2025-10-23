@@ -61,13 +61,13 @@ class ManeuverEnv:
         missilesSpeed: float = 680.0,
         InterceptorNum: int = 8,
         InterceptorSpeed: float = 540.0,
-        curiosity_scale: float = 0.5,
-        punish_penalty: float = 0.4,
+        curiosity_scale: float = 0.1,
+        punish_penalty: float = 1.0,
         launch_gap: int = LanchGap,
         reward_weights: RewardWeights | None = None,
     ) -> None:
         self.reward_weights = reward_weights or RewardWeights()
-        self.curiosity_scale = curiosity_scale
+        self.curiosity_scale = max(0.0, float(curiosity_scale))
         self.punish_penalty = max(0.0, float(punish_penalty))
         self.launch_gap = max(1, int(launch_gap))
 
@@ -615,7 +615,7 @@ class ManeuverEnv:
             info = {**info, 'constraint_violation': False}
 
         curiosity_bonus = 0.0
-        if action != self.At_1:
+        if valid_action and action != self.At_1:
             curiosity_bonus = float(self.curiosity_scale)
             reward += curiosity_bonus
 
@@ -685,7 +685,7 @@ class ManeuverEnv:
             info = {**info, 'constraint_violation': True}
 
         curiosity_bonus = 0.0
-        if action != self.At_1:
+        if (not info.get('constraint_violation', False)) and action != self.At_1:
             curiosity_bonus = float(self.curiosity_scale)
             reward += curiosity_bonus
 
