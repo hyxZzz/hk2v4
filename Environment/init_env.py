@@ -9,10 +9,10 @@ from Environment.reset_env import reset_cooperative_para
 # 环境的来袭导弹数num_missiles，最大步数StepNum
 
 def init_env(
-    num_missiles=3,
-    StepNum=1000,
-    interceptor_num=8,
-    num_aircraft=1,
+    num_missiles=4,
+    StepNum=3500,
+    interceptor_num=6,
+    num_aircraft=2,
     interceptors_per_plane=None,
 ):
     if num_aircraft <= 1:

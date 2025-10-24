@@ -29,7 +29,7 @@ class ManeuverEnv:
                         """
 
     def __init__(self, missileList: List[Missiles], aircraftList: Aircraft, planeSpeed=170,
-                 missilesNum=3, spaceSize=5000, missilesSpeed=680, InterceptorNum=8, InterceptorSpeed=540):
+                 missilesNum=4, spaceSize=3500, missilesSpeed=680, InterceptorNum=6, InterceptorSpeed=540):
         self.escapeFlag = -1
         self.action_space = spaces.Discrete(act_num)
         self.spaceSize = spaceSize
@@ -970,7 +970,7 @@ class CooperativeManeuverEnv:
         aircraft_list: List[Aircraft],
         planeSpeed=170,
         missilesNum=4,
-        spaceSize=5000,
+        spaceSize=3500,
         missilesSpeed=680,
         interceptors_per_plane=6,
         interceptorSpeed=540,
