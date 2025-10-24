@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Sequence
 
+import math
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
@@ -21,6 +22,32 @@ from utils.validate import (
 writer = SummaryWriter('./models/DQNmodels/DDQNmodels3_23/runs/train_process_multi_agent')
 
 
+class ExponentialEpsilonScheduler:
+    def __init__(
+        self,
+        epsilon_start: float,
+        epsilon_end: float,
+        decay_rate: float,
+    ) -> None:
+        self.epsilon_start = float(epsilon_start)
+        self.epsilon_end = float(epsilon_end)
+        self.decay_rate = float(max(decay_rate, 0.0))
+        self.total_env_steps = 0
+
+    def get_epsilon(self) -> float:
+        if self.decay_rate <= 0.0:
+            return self.epsilon_start
+
+        decayed = self.epsilon_end + (
+            (self.epsilon_start - self.epsilon_end)
+            * math.exp(-self.decay_rate * self.total_env_steps)
+        )
+        return max(self.epsilon_end, decayed)
+
+    def step(self, steps: int = 1) -> None:
+        self.total_env_steps += max(steps, 0)
+
+
 @dataclass
 class EvaluationMetrics:
     mean_total_reward: float
@@ -36,6 +63,7 @@ def run_train_episode(
     learn_freq: int,
     batch_size: int,
     train_loops: int,
+    epsilon_scheduler=None,
 ):
     num_agents = len(agents)
     total_rewards = np.zeros(num_agents, dtype=np.float32)
@@ -46,6 +74,11 @@ def run_train_episode(
 
     while True:
         step += 1
+        if epsilon_scheduler is not None:
+            epsilon = epsilon_scheduler.get_epsilon()
+            for agent in agents:
+                agent.e_greed = max(agent.min_epsilon, epsilon)
+
         actions = [agent.sample(states[i]) for i, agent in enumerate(agents)]
         next_states, rewards, done_flag, _ = env.step(actions)
 
@@ -79,6 +112,9 @@ def run_train_episode(
         total_rewards += np.array(rewards, dtype=np.float32)
         states = next_states
 
+        if epsilon_scheduler is not None:
+            epsilon_scheduler.step()
+
         if done_flag != -1:
             break
 
@@ -87,7 +123,7 @@ def run_train_episode(
         for idx in range(num_agents)
     ]
 
-    return total_rewards, mean_losses
+    return total_rewards, mean_losses, step
 
 
 def evaluate_agents(
@@ -154,17 +190,23 @@ def evaluate_agents(
 def main():
     parser = argparse.ArgumentParser(description='multi-agent cooperative defence training')
 
-    parser.add_argument('--memory_size', type=int, default=60000, help='Size of replay memory')
-    parser.add_argument('--memory_warmup_size', type=int, default=4000, help='Warmup size of replay memory')
+    parser.add_argument('--memory_size', type=int, default=120000, help='Size of replay memory')
+    parser.add_argument('--memory_warmup_size', type=int, default=10000, help='Warmup size of replay memory')
     parser.add_argument('--learn_freq', type=int, default=1, help='Frequency of learning updates')
-    parser.add_argument('--batch_size', type=int, default=512, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for training')
     parser.add_argument('--gamma', type=float, default=0.993, help='Discount factor')
     parser.add_argument(
         '--target_update_freq',
         type=int,
-        default=15,
+        default=600,
         help='Number of learning steps between target network updates',
+    )
+    parser.add_argument(
+        '--target_update_tau',
+        type=float,
+        default=0.02,
+        help='Soft update coefficient for target network (0 for hard update)',
     )
     parser.add_argument(
         '--train_loops',
@@ -199,12 +241,23 @@ def main():
 
     replay_buffers = [MyMemoryBuffer(args.memory_size) for _ in range(num_aircraft)]
 
-    epsilon_start = 0.85
-    epsilon_end = 0.05
-    decay_ratio = 0.2
-    decay_target_episodes = max(1, int(args.max_episode * decay_ratio))
-    decay_steps = max(1, int(step_num * decay_target_episodes))
-    epsilon_decrement = (epsilon_start - epsilon_end) / decay_steps
+    epsilon_start = 0.95
+    epsilon_end = 0.03
+    decay_ratio = 0.6
+    expected_steps_per_episode = step_num
+    decay_target_steps = max(
+        1, int(expected_steps_per_episode * args.max_episode * decay_ratio)
+    )
+    target_epsilon = epsilon_end * 1.2
+    ratio_numerator = max(target_epsilon - epsilon_end, 1e-6)
+    ratio_denominator = max(epsilon_start - epsilon_end, 1e-6)
+    decay_ratio_clamped = min(
+        max(ratio_numerator / ratio_denominator, 1e-6), 0.999999
+    )
+    decay_rate = -math.log(decay_ratio_clamped) / decay_target_steps
+    epsilon_scheduler = ExponentialEpsilonScheduler(
+        epsilon_start, epsilon_end, decay_rate
+    )
 
     agents: List[MyDQNAgent] = []
     for action_size in action_sizes:
@@ -215,9 +268,10 @@ def main():
             gamma=args.gamma,
             lr=args.learning_rate,
             e_greed=epsilon_start,
-            e_greed_decrement=epsilon_decrement,
+            e_greed_decrement=0.0,
             min_epsilon=epsilon_end,
             update_target_steps=args.target_update_freq,
+            soft_update_tau=args.target_update_tau,
         )
         agents.append(agent)
 
@@ -241,7 +295,7 @@ def main():
 
     while episode < max_episode:
         for _ in range(50):
-            total_reward, train_losses = run_train_episode(
+            total_reward, train_losses, episode_steps = run_train_episode(
                 agents,
                 env,
                 replay_buffers,
@@ -249,11 +303,15 @@ def main():
                 args.learn_freq,
                 args.batch_size,
                 args.train_loops,
+                epsilon_scheduler,
             )
             mean_reward = float(np.mean(total_reward))
             mean_loss = float(np.mean(train_losses))
             writer.add_scalar('train/mean_reward', mean_reward, episode)
             writer.add_scalar('train/mean_loss', mean_loss, episode)
+            current_epsilon = float(np.mean([agent.e_greed for agent in agents]))
+            writer.add_scalar('train/epsilon', current_epsilon, episode)
+            writer.add_scalar('train/episode_steps', episode_steps, episode)
             episode += 1
             if episode >= max_episode:
                 break
