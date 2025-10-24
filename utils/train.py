@@ -1,7 +1,7 @@
 import argparse
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import List, Sequence
 
 import numpy as np
 import torch
@@ -32,8 +32,6 @@ def run_train_episode(
     agents: Sequence[MyDQNAgent],
     env,
     replay_buffers: Sequence[MyMemoryBuffer],
-    shared_buffers: Dict[int, MyMemoryBuffer],
-    agent_action_sizes: Sequence[int],
     memory_warmup_size: int,
     learn_freq: int,
     batch_size: int,
@@ -41,9 +39,8 @@ def run_train_episode(
 ):
     num_agents = len(agents)
     total_rewards = np.zeros(num_agents, dtype=np.float32)
-    train_losses = [0.0 for _ in range(num_agents)]
-    unique_action_sizes = tuple(sorted(set(agent_action_sizes)))
-
+    loss_sums = [0.0 for _ in range(num_agents)]
+    loss_counts = [0 for _ in range(num_agents)]
     states, _, _ = env.reset()
     step = 0
 
@@ -55,19 +52,18 @@ def run_train_episode(
         for idx in range(num_agents):
             experience = (states[idx], actions[idx], rewards[idx], next_states[idx], done_flag)
             replay_buffers[idx].add(experience)
-            shared_buffers[agent_action_sizes[idx]].add(experience)
 
         can_learn = step % learn_freq == 0 and all(
-            shared_buffers[action_size].size() > memory_warmup_size for action_size in unique_action_sizes
+            buffer.size() > memory_warmup_size for buffer in replay_buffers
         )
 
         if can_learn:
             for _ in range(max(1, train_loops)):
                 for idx, agent in enumerate(agents):
-                    shared_buffer = shared_buffers[agent_action_sizes[idx]]
-                    if shared_buffer.size() <= memory_warmup_size:
+                    agent_buffer = replay_buffers[idx]
+                    if agent_buffer.size() <= memory_warmup_size:
                         continue
-                    experiences = shared_buffer.sample(batch_size)
+                    experiences = agent_buffer.sample(batch_size)
                     if not experiences:
                         continue
                     batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(
@@ -76,7 +72,9 @@ def run_train_episode(
                     loss = agent.learn(
                         batch_state, batch_action, batch_reward, batch_next_state, batch_done
                     )
-                    train_losses[idx] = float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
+                    loss_value = loss.detach().cpu().item() if torch.is_tensor(loss) else loss
+                    loss_sums[idx] += float(loss_value)
+                    loss_counts[idx] += 1
 
         total_rewards += np.array(rewards, dtype=np.float32)
         states = next_states
@@ -84,7 +82,12 @@ def run_train_episode(
         if done_flag != -1:
             break
 
-    return total_rewards, train_losses
+    mean_losses = [
+        (loss_sums[idx] / loss_counts[idx]) if loss_counts[idx] > 0 else 0.0
+        for idx in range(num_agents)
+    ]
+
+    return total_rewards, mean_losses
 
 
 def evaluate_agents(
@@ -195,9 +198,6 @@ def main():
     state_size = env.get_observation_size()
 
     replay_buffers = [MyMemoryBuffer(args.memory_size) for _ in range(num_aircraft)]
-    shared_buffers = {
-        action_size: MyMemoryBuffer(args.memory_size) for action_size in set(action_sizes)
-    }
 
     epsilon_start = 0.85
     epsilon_end = 0.05
@@ -245,8 +245,6 @@ def main():
                 agents,
                 env,
                 replay_buffers,
-                shared_buffers,
-                action_sizes,
                 args.memory_warmup_size,
                 args.learn_freq,
                 args.batch_size,
