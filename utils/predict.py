@@ -36,8 +36,35 @@ def calTreatFromState(apos, mpos, v_a, v_m):
 LEARNING_RATE = 5e-4
 MAXSTEP = 3500
 GAMMA = 0.993
-DEFAULT_NUM_MISSILES = 3
-DEFAULT_INTERCEPTOR_NUM = 8
+DEFAULT_NUM_MISSILES = 4
+DEFAULT_INTERCEPTOR_NUM = 6
+DEFAULT_NUM_AIRCRAFT = 2
+
+
+def _is_cooperative_env(env) -> bool:
+    return getattr(env, "num_agents", 1) > 1
+
+
+def _get_entity_matrix(env):
+    if hasattr(env, "_get_obs"):
+        return env._get_obs()
+    if hasattr(env, "_compose_entities"):
+        return env._compose_entities()
+    raise AttributeError("无法获取环境实体矩阵表示")
+
+
+def _get_primary_aircraft(env):
+    aircrafts = env.aircraftList
+    if _is_cooperative_env(env):
+        return aircrafts[0]
+    return aircrafts
+
+
+def _total_remaining_interceptors(env) -> int:
+    remain = getattr(env, "interceptor_remain", 0)
+    if isinstance(remain, list):
+        return int(sum(remain))
+    return int(remain)
 
 
 # 预测函数，输入模型的保存地址，进行一次预测，返回一次游戏的state序列
@@ -46,14 +73,27 @@ def predictResult(model_path):
     # 生成2个导弹的 随机的 环境
     Env, aircraft, missiles = init_env(
         num_missiles=DEFAULT_NUM_MISSILES,
-        StepNum=3500,
+        StepNum=MAXSTEP,
         interceptor_num=DEFAULT_INTERCEPTOR_NUM,
+        num_aircraft=DEFAULT_NUM_AIRCRAFT,
+        interceptors_per_plane=DEFAULT_INTERCEPTOR_NUM,
     )
     num_missiles = Env.missileNum
     escapeFlag = -1
 
-    state_size = Env._getNewStateSpace()[0]
-    action_size = Env._get_actSpace()
+    cooperative = _is_cooperative_env(Env)
+    if cooperative:
+        action_sizes = Env.get_action_sizes()
+        if len(set(action_sizes)) != 1:
+            raise ValueError("当前预测脚本仅支持动作空间一致的协同环境")
+        action_size = action_sizes[0]
+        state_size = Env.get_observation_size()
+        num_agents = Env.num_agents
+    else:
+        state_size = Env._getNewStateSpace()[0]
+        action_size = Env._get_actSpace()
+        num_agents = 1
+
     # # 生成智能体
     model = Double_DQN(state_size=state_size, action_size=action_size)
 
@@ -69,23 +109,33 @@ def predictResult(model_path):
     agent = MyDQNAgent(model, action_size, gamma=GAMMA, lr=LEARNING_RATE, e_greed=0.1, e_greed_decrement=1e-6)
 
     state = np.zeros((MAXSTEP + 1, state_size), dtype=np.float32)
-    obs_rows = Env._get_obs().shape[0]
+    obs_rows = _get_entity_matrix(Env).shape[0]
     statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 6), dtype=np.float32)
     Treat_value = np.zeros((MAXSTEP,), dtype=np.float32)
-    state[0], escapeFlag, info = Env.reset()
-    state_copy = [state[0], escapeFlag, info]
+    if cooperative:
+        agent_states, escapeFlag, info = Env.reset()
+        state[0] = agent_states[0]
+        state_copy = [copy.deepcopy(agent_states), escapeFlag, info]
+    else:
+        state[0], escapeFlag, info = Env.reset()
+        state_copy = [state[0], escapeFlag, info]
     Env_compare = copy.deepcopy(Env)
     # print(Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z)
-    statefromEnv[0] = Env._get_obs()
+    statefromEnv[0] = _get_entity_matrix(Env)
 
     # 记录步数，防止画图时过多0点
     t = 0
-    Treat = 0
     # 循环
     for i in range(MAXSTEP):
         # 通过智能体模型选动作
         # print(state[i])
-        act = agent.predict(state[i])
+        if cooperative:
+            actions = []
+            for idx in range(num_agents):
+                current_state = agent_states[idx]
+                actions.append(agent.predict(current_state))
+        else:
+            act = agent.predict(state[i])
         # print("act")
         # print(act)
         # 与环境交互
@@ -94,10 +144,18 @@ def predictResult(model_path):
         # else:
         #     act = 61
 
-        next_state, reward, escapeFlag, info = Env.step(act)
+        if cooperative:
+            next_states, rewards, escapeFlag, info = Env.step(actions)
+            agent_states = next_states
+            next_state = next_states[0]
+            reward = rewards[0]
+        else:
+            next_state, reward, escapeFlag, info = Env.step(act)
+
         # 获取环境中飞机的速度
-        v_a = Env.aircraftList.V
-        apos = [Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z]
+        primary_aircraft = _get_primary_aircraft(Env)
+        v_a = primary_aircraft.V
+        apos = [primary_aircraft.X, primary_aircraft.Y, primary_aircraft.Z]
         for j in range(num_missiles):
             # 计算威胁度：这里的威胁度将已失效的导弹减去
             if Env.missileList[j].attacking:
@@ -106,8 +164,8 @@ def predictResult(model_path):
                 T = calTreatFromState(apos, mpos, v_a, v_m)
                 if T > 100 or T < 0:
                     print(T)
-                if Treat < calTreatFromState(apos, mpos, v_a, v_m):
-                    Treat_value[i] = calTreatFromState(apos, mpos, v_a, v_m)
+                if Treat_value[i] < T:
+                    Treat_value[i] = T
                 if Treat_value[i] > 100 or Treat_value[i] < 0:
                     print(Treat_value[i])
                 # print(Treat_value[i])
@@ -115,13 +173,13 @@ def predictResult(model_path):
         # print(Treat_value[i], EvaResult)
         # 记录下一个时刻状态
         # 拉长向量
-        statefromEnv[i + 1] = Env._get_obs()
+        statefromEnv[i + 1] = _get_entity_matrix(Env)
         state[i + 1] = next_state
         t = i + 1
         if escapeFlag != -1:
             # print(info)
             break
-    remain_intceptor = Env.interceptor_remain
+    remain_intceptor = _total_remaining_interceptors(Env)
     if escapeFlag == 1:
         Treat_value[t - 1] = 0
 
@@ -131,49 +189,53 @@ def predictResult(model_path):
 # 对比预测函数，随机策略展示强化学习的作用，进行一次预测，返回一次游戏的state序列
 
 def ComparepredictResult(Env: ManeuverEnv, state_copy: List):
-    # print(Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z)
-    state_size = Env._getNewStateSpace()[0]
-    # # 生成智能体
-    escapeFlag = -1
+    cooperative = _is_cooperative_env(Env)
+    if cooperative:
+        agent_states, escapeFlag, info = state_copy
+        num_agents = Env.num_agents
+        state_size = Env.get_observation_size()
+        state0 = copy.deepcopy(agent_states[0])
+    else:
+        state_size = Env._getNewStateSpace()[0]
+        state0, escapeFlag, info = state_copy
+        num_agents = 1
+
     state = np.zeros((MAXSTEP + 1, state_size), dtype=np.float32)
-    obs_rows = Env._get_obs().shape[0]
+    obs_rows = _get_entity_matrix(Env).shape[0]
     statefromEnv = np.zeros((MAXSTEP + 1, obs_rows, 6), dtype=np.float32)
     Treat_value = np.zeros((MAXSTEP,), dtype=np.float32)
-    state[0], escapeFlag, info = state_copy
-    statefromEnv[0] = Env._get_obs()
+    state[0] = state0
+    statefromEnv[0] = _get_entity_matrix(Env)
 
-    # 记录步数，防止画图时过多0点
     t = 0
-    Treat = 0
-    # 循环
     for i in range(MAXSTEP):
-        # 通过智能体模型选动作
-        act = 0
-        # act = 2
-        # 与环境交互
-        next_state, reward, escapeFlag, info = Env.compareTest(act)
-        # print(act)
-        # 获取环境中飞机的速度
-        v_a = Env.aircraftList.V
-        apos = [Env.aircraftList.X, Env.aircraftList.Y, Env.aircraftList.Z]
+        if cooperative:
+            actions = [0 for _ in range(num_agents)]
+            next_states, rewards, escapeFlag, info = Env.step(actions)
+            next_state = next_states[0]
+        else:
+            act = 0
+            next_state, reward, escapeFlag, info = Env.compareTest(act)
+
+        primary_aircraft = _get_primary_aircraft(Env)
+        v_a = primary_aircraft.V
+        apos = [primary_aircraft.X, primary_aircraft.Y, primary_aircraft.Z]
         for j in range(Env.missileNum):
-            # 计算威胁度：这里的威胁度将已失效的导弹减去
             if Env.missileList[j].attacking:
                 v_m = Env.missileList[j].V
                 mpos = [Env.missileList[j].X, Env.missileList[j].Y, Env.missileList[j].Z]
-                if Treat < calTreatFromState(apos, mpos, v_a, v_m):
+                if Treat_value[i] < calTreatFromState(apos, mpos, v_a, v_m):
                     Treat_value[i] = calTreatFromState(apos, mpos, v_a, v_m)
                 if Treat_value[i] > 100 or Treat_value[i] < 0:
                     print(Treat_value[i])
-        # 记录下一个时刻状态
-        # 拉长向量
-        statefromEnv[i + 1] = Env._get_obs()
+
+        statefromEnv[i + 1] = _get_entity_matrix(Env)
         state[i + 1] = next_state
         t = i + 1
         if escapeFlag != -1:
-            # print(info)
             break
-    interceptor_remain = Env.interceptor_remain
+
+    interceptor_remain = _total_remaining_interceptors(Env)
 
     return t, statefromEnv, Treat_value, interceptor_remain, escapeFlag
 
