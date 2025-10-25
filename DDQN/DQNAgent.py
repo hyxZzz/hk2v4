@@ -9,12 +9,18 @@ import torch.optim as optim
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 更新目标网络的操作函数，在MyDQNAgent.learn()函数中调用
-def soft_update(target, source, tau=0):
-    # zip() 函数用于将可迭代的对象作为参数，将对象中对应的元素打包成一个个元组，然后返回由这些元组组成的列表。
-    # print(target.parameters())
-    target.load_state_dict(source.state_dict())
-    # print(target.parameters())
-        # target_param.set_para(target_param*tau+param*(1.0-tau))
+def soft_update(target, source, tau=0.0):
+    """Polyak averaging update for the target network."""
+
+    tau = float(tau)
+    if tau <= 0.0:
+        target.load_state_dict(source.state_dict())
+        return
+
+    with torch.no_grad():
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.mul_(1.0 - tau)
+            target_param.add_(tau * param)
 
 
 class MyDQNAgent:
@@ -29,13 +35,15 @@ class MyDQNAgent:
         e_greed_decrement=0,
         min_epsilon=0.1,
         update_target_steps=15,
+        soft_update_tau=0.0,
     ):
 
         self.action_size = action_size
         self.global_step = 0
         self.update_target_steps = max(1, int(update_target_steps))
+        self.soft_update_tau = float(soft_update_tau)
         self.e_greed = e_greed  # ϵ-greedy中的ϵ
-        self.e_greed_decrement = e_greed_decrement  # ϵ的动态更新因子
+        self.e_greed_decrement = e_greed_decrement  # ϵ的动态更新因子（训练脚本负责调度）
         self.min_epsilon = min_epsilon
         self.model = model.to(device)
         self.target_model = copy.deepcopy(model).to(device)
@@ -45,21 +53,16 @@ class MyDQNAgent:
         self.optimizer = optim.Adam(lr=lr, params=self.model.parameters())
 
     def _update_target_model(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        soft_update(self.target_model, self.model, self.soft_update_tau)
 
     # 使用行为策略生成动作
     def sample(self, state):
 
         sample = np.random.random()  # [0.0, 1.0)
         if sample < self.e_greed:
-            act = np.random.randint(self.action_size)  # 返回[0, action_size)的整数，这里就是0或1
-        else:
-            act = self.predict(state)
+            return np.random.randint(self.action_size)  # 返回[0, action_size)的整数，这里就是0或1
 
-        # 动态更改e_greed,但不小于设定的最小值
-        self.e_greed = max(self.min_epsilon, self.e_greed - self.e_greed_decrement)
-
-        return act
+        return self.predict(state)
 
     # DQN网络做预测
     def predict(self, state):
