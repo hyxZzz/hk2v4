@@ -1,4 +1,4 @@
-"""可视化脚本：加载指定权重，在固定随机种子下生成三维轨迹图。"""
+"""可视化脚本：加载指定权重，在固定随机种子下生成三维轨迹GIF动画。"""
 
 import argparse
 import os
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import numpy as np
 import torch
 
@@ -245,85 +246,121 @@ def _line_has_motion(points: Sequence[np.ndarray]) -> bool:
     return not np.allclose(stacked[0], stacked, atol=1e-3)
 
 
-def plot_trajectories(
+def _collect_all_points(recorder: TrajectoryRecorder) -> np.ndarray:
+    """将所有记录的点拼接为数组，用于计算轴范围。"""
+    points: List[np.ndarray] = []
+    for traj_group in (
+        recorder.aircraft_logs,
+        recorder.missile_logs,
+        recorder.interceptor_logs,
+    ):
+        for traj in traj_group:
+            if traj:
+                points.extend(traj)
+    if not points:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.vstack(points)
+
+
+def _compute_axis_limits(recorder: TrajectoryRecorder):
+    """根据所有轨迹点计算坐标轴范围，留出适当边距。"""
+    points = _collect_all_points(recorder)
+    if points.size == 0:
+        return (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)
+
+    min_vals = points.min(axis=0)
+    max_vals = points.max(axis=0)
+    span = np.maximum(max_vals - min_vals, 1e-3)
+    padding = np.maximum(span * 0.05, 1.0)
+
+    xlim = (float(min_vals[0] - padding[0]), float(max_vals[0] + padding[0]))
+    ylim = (float(min_vals[1] - padding[1]), float(max_vals[1] + padding[1]))
+    zlim = (float(min_vals[2] - padding[2]), float(max_vals[2] + padding[2]))
+    return xlim, ylim, zlim
+
+
+def _setup_axis(ax, title: str, recorder: TrajectoryRecorder) -> None:
+    ax.set_title(title)
+    ax.set_xlabel("X / m")
+    ax.set_ylabel("Y (Altitude) / m")
+    ax.set_zlabel("Z / m")
+
+    xlim, ylim, zlim = _compute_axis_limits(recorder)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_zlim(*zlim)
+
+
+def _update_line(line, points: Sequence[np.ndarray], frame: int):
+    if not points:
+        return line
+    max_index = min(frame + 1, len(points))
+    data = np.vstack(points[:max_index])
+    line.set_data(data[:, 0], data[:, 1])
+    line.set_3d_properties(data[:, 2])
+    return line
+
+
+def save_trajectory_gif(
     recorder: TrajectoryRecorder,
     output_path: Path,
     title: str,
+    interval: int = 150,
 ) -> None:
-    """绘制三维轨迹并保存。"""
+    """生成三维轨迹随时间演化的GIF动画。"""
+    max_frames = 0
+    for traj_group in (
+        recorder.aircraft_logs,
+        recorder.missile_logs,
+        recorder.interceptor_logs,
+    ):
+        for traj in traj_group:
+            max_frames = max(max_frames, len(traj))
+
+    if max_frames == 0:
+        raise ValueError("无可用于生成动画的轨迹数据")
+
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
-
     plane_colors = ["tab:blue", "tab:orange", "tab:purple", "tab:cyan", "tab:pink", "tab:olive"]
 
+    _setup_axis(ax, title, recorder)
+
+    line_handles = []
     for idx, traj in enumerate(recorder.aircraft_logs):
-        if not traj:
-            continue
-        aircraft_points = np.vstack(traj)
         color = plane_colors[idx % len(plane_colors)]
-        label = recorder.aircraft_labels[idx] if idx < len(recorder.aircraft_labels) else f"Aircraft {idx + 1}"
-        ax.plot(
-            aircraft_points[:, 0],
-            aircraft_points[:, 1],
-            aircraft_points[:, 2],
-            color=color,
-            label=label,
-            linewidth=2.0,
+        label = (
+            recorder.aircraft_labels[idx]
+            if idx < len(recorder.aircraft_labels)
+            else f"Aircraft {idx + 1}"
         )
-        ax.scatter(
-            aircraft_points[0, 0],
-            aircraft_points[0, 1],
-            aircraft_points[0, 2],
-            color=color,
-            marker="o",
-            s=60,
-            label=f"{label} Start",
-        )
-        ax.scatter(
-            aircraft_points[-1, 0],
-            aircraft_points[-1, 1],
-            aircraft_points[-1, 2],
-            color=color,
-            marker="^",
-            s=60,
-            label=f"{label} End",
-        )
+        (line,) = ax.plot([], [], [], color=color, linewidth=2.0, label=label)
+        if traj:
+            ax.scatter(
+                traj[0][0], traj[0][1], traj[0][2], color=color, marker="o", s=60, label=f"{label} Start"
+            )
+            ax.scatter(
+                traj[-1][0], traj[-1][1], traj[-1][2], color=color, marker="^", s=60, label=f"{label} End"
+            )
+        line_handles.append((line, traj))
 
     for idx, traj in enumerate(recorder.missile_logs):
-        if not _line_has_motion(traj):
-            continue
-        missile_points = np.vstack(traj)
-        label = recorder.missile_labels[idx] if idx < len(recorder.missile_labels) else f"Missile {idx + 1}"
-        ax.plot(
-            missile_points[:, 0],
-            missile_points[:, 1],
-            missile_points[:, 2],
-            linestyle="--",
-            color="tab:red",
-            label=label,
+        label = (
+            recorder.missile_labels[idx]
+            if idx < len(recorder.missile_labels)
+            else f"Missile {idx + 1}"
         )
+        (line,) = ax.plot([], [], [], linestyle="--", color="tab:red", label=label)
+        line_handles.append((line, traj))
 
     for idx, traj in enumerate(recorder.interceptor_logs):
-        if not _line_has_motion(traj):
-            continue
-        interceptor_points = np.vstack(traj)
         label = (
             recorder.interceptor_labels[idx]
             if idx < len(recorder.interceptor_labels)
             else f"Interceptor {idx + 1}"
         )
-        ax.plot(
-            interceptor_points[:, 0],
-            interceptor_points[:, 1],
-            interceptor_points[:, 2],
-            color="tab:green",
-            label=label,
-        )
-
-    ax.set_title(title)
-    ax.set_xlabel("X / m")
-    ax.set_ylabel("Y (Altitude) / m")
-    ax.set_zlabel("Z / m")
+        (line,) = ax.plot([], [], [], color="tab:green", label=label)
+        line_handles.append((line, traj))
 
     handles, labels = ax.get_legend_handles_labels()
     unique = OrderedDict()
@@ -333,14 +370,29 @@ def plot_trajectories(
     ax.legend(unique.values(), unique.keys(), loc="upper right", fontsize="small", ncol=2)
     ax.grid(True, alpha=0.3)
 
+    def _animate(frame: int):
+        artists = []
+        for line, points in line_handles:
+            artists.append(_update_line(line, points, frame))
+        return artists
+
+    ani = animation.FuncAnimation(
+        fig,
+        _animate,
+        frames=max_frames,
+        interval=interval,
+        blit=False,
+        repeat=False,
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
+    fps = max(1, int(round(1000.0 / interval)))
+    ani.save(str(output_path), writer=animation.PillowWriter(fps=fps))
     plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="加载DDQN权重生成三维轨迹图")
+    parser = argparse.ArgumentParser(description="加载DDQN权重生成三维轨迹动画")
     parser.add_argument("--checkpoint", required=True, help="DDQN权重文件路径")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--num-missiles", type=int, default=4, help="来袭导弹数量")
@@ -353,10 +405,10 @@ def parse_args() -> argparse.Namespace:
         help="每架飞机的拦截弹数量（单机模式即总数）",
     )
     parser.add_argument(
-        "--output", default="outputs/trajectory.png", help="三维轨迹图输出路径"
+        "--max-steps", type=int, default=None, help="可选的最大步数截断，调试用"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=None, help="可选的最大步数截断，调试用"
+        "--gif", default="outputs/trajectory.gif", help="三维轨迹动画输出路径（.gif）"
     )
     return parser.parse_args()
 
@@ -394,9 +446,9 @@ def main() -> None:
     if info:
         title = f"{title}\n{info}"
 
-    output_path = Path(args.output)
-    plot_trajectories(recorder, output_path, title)
-    print(f"轨迹图已保存至: {output_path}")
+    gif_path = Path(args.gif)
+    save_trajectory_gif(recorder, gif_path, title)
+    print(f"轨迹动画已保存至: {gif_path}")
 
 
 if __name__ == "__main__":
