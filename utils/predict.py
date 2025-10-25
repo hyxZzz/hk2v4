@@ -13,6 +13,9 @@ from Environment.init_env import init_env
 from DDQN.DDQN import Double_DQN
 from flat_models.ThreatEvaluate import CalTreat, intervalEvaluation
 
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 plt.rcParams["font.sans-serif"] = ["SimHei"]  # 设置字体
 plt.rcParams["axes.unicode_minus"] = False  # 该语句解决图像中的“-”负号的乱码问题
 
@@ -97,7 +100,7 @@ def predictResult(model_path):
     # # 生成智能体
     model = Double_DQN(state_size=state_size, action_size=action_size)
 
-    state_dic = torch.load(model_path, map_location='cuda:0')
+    state_dic = torch.load(model_path, map_location=DEVICE)
     new_state = {}
     for k, v in state_dic.items():  # 去除关键字”model"
         new_state = v
