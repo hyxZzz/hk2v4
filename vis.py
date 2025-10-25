@@ -305,7 +305,7 @@ def save_trajectory_gif(
     recorder: TrajectoryRecorder,
     output_path: Path,
     title: str,
-    interval: int = 150,
+    interval: int = 80,
 ) -> None:
     """生成三维轨迹随时间演化的GIF动画。"""
     max_frames = 0
@@ -335,13 +335,6 @@ def save_trajectory_gif(
             else f"Aircraft {idx + 1}"
         )
         (line,) = ax.plot([], [], [], color=color, linewidth=2.0, label=label)
-        if traj:
-            ax.scatter(
-                traj[0][0], traj[0][1], traj[0][2], color=color, marker="o", s=60, label=f"{label} Start"
-            )
-            ax.scatter(
-                traj[-1][0], traj[-1][1], traj[-1][2], color=color, marker="^", s=60, label=f"{label} End"
-            )
         line_handles.append((line, traj))
 
     for idx, traj in enumerate(recorder.missile_logs):
