@@ -190,22 +190,22 @@ def evaluate_agents(
 def main():
     parser = argparse.ArgumentParser(description='multi-agent cooperative defence training')
 
-    parser.add_argument('--memory_size', type=int, default=120000, help='Size of replay memory')
-    parser.add_argument('--memory_warmup_size', type=int, default=10000, help='Warmup size of replay memory')
+    parser.add_argument('--memory_size', type=int, default=160000, help='Size of replay memory')
+    parser.add_argument('--memory_warmup_size', type=int, default=15000, help='Warmup size of replay memory')
     parser.add_argument('--learn_freq', type=int, default=1, help='Frequency of learning updates')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
-    parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for training')
+    parser.add_argument('--learning_rate', type=float, default=3e-4, help='Learning rate for training')
     parser.add_argument('--gamma', type=float, default=0.993, help='Discount factor')
     parser.add_argument(
         '--target_update_freq',
         type=int,
-        default=600,
+        default=800,
         help='Number of learning steps between target network updates',
     )
     parser.add_argument(
         '--target_update_tau',
         type=float,
-        default=0.02,
+        default=0.015,
         help='Soft update coefficient for target network (0 for hard update)',
     )
     parser.add_argument(
@@ -242,9 +242,9 @@ def main():
     replay_buffers = [MyMemoryBuffer(args.memory_size) for _ in range(num_aircraft)]
 
     epsilon_start = 0.95
-    epsilon_end = 0.03
-    decay_ratio = 0.6
-    expected_steps_per_episode = step_num
+    epsilon_end = 0.02
+    decay_ratio = 0.5
+    expected_steps_per_episode = int(step_num * 0.9)
     decay_target_steps = max(
         1, int(expected_steps_per_episode * args.max_episode * decay_ratio)
     )
