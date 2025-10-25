@@ -1,10 +1,12 @@
 """可视化脚本：加载指定权重，在固定随机种子下生成三维轨迹图。"""
+
 import argparse
 import os
 import random
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,8 +26,8 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_agent(state_size: int, action_size: int) -> MyDQNAgent:
-    """构造推理用的智能体。"""
+def _create_agent(state_size: int, action_size: int) -> MyDQNAgent:
+    """根据状态/动作维度构造一个推理用智能体。"""
     model = Double_DQN(state_size=state_size, action_size=action_size)
     agent = MyDQNAgent(
         model,
@@ -40,7 +42,20 @@ def build_agent(state_size: int, action_size: int) -> MyDQNAgent:
     return agent
 
 
-def load_checkpoint(agent: MyDQNAgent, checkpoint_path: str) -> None:
+def build_agents(env) -> List[MyDQNAgent]:
+    """根据环境类型（单机或多机）构建一个或多个智能体。"""
+
+    if hasattr(env, "get_action_sizes") and callable(getattr(env, "get_action_sizes")):
+        action_sizes = [int(size) for size in env.get_action_sizes()]
+        state_size = int(env.get_observation_size())
+        return [_create_agent(state_size, action_size) for action_size in action_sizes]
+
+    state_size = int(env._getNewStateSpace()[0])
+    action_size = int(env._get_actSpace())
+    return [_create_agent(state_size, action_size)]
+
+
+def load_checkpoint(agents: Sequence[MyDQNAgent], checkpoint_path: str) -> None:
     """加载权重，兼容多种保存格式。"""
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"未找到权重文件: {checkpoint_path}")
@@ -52,64 +67,174 @@ def load_checkpoint(agent: MyDQNAgent, checkpoint_path: str) -> None:
         keys = [key for key in state.keys() if key.startswith("model_agent_")]
         if keys:
             # 单智能体可直接取首个
-            agent_key = sorted(keys)[0]
-            state = state[agent_key]
+            for idx, agent in enumerate(agents):
+                key = f"model_agent_{idx}"
+                if key not in state:
+                    raise KeyError(
+                        f"权重文件缺少键 {key}，无法加载第 {idx + 1} 个智能体的参数"
+                    )
+                try:
+                    agent.model.load_state_dict(state[key])
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "模型结构与权重不匹配，请确认环境配置与训练时保持一致"
+                    ) from exc
+                agent.target_model.load_state_dict(agent.model.state_dict())
+            return
         elif "model" in state:
             state = state["model"]
         elif "state_dict" in state:
             state = state["state_dict"]
 
-    agent.model.load_state_dict(state)
+    if len(agents) != 1:
+        raise ValueError("权重文件为单智能体格式，但当前环境构造了多个智能体")
+
+    agent = agents[0]
+    try:
+        agent.model.load_state_dict(state)
+    except RuntimeError as exc:
+        raise RuntimeError("模型结构与权重不匹配，请确认环境配置与训练时保持一致") from exc
     agent.target_model.load_state_dict(agent.model.state_dict())
 
 
-def record_positions(env, aircraft_log: List[np.ndarray], missile_logs: List[List[np.ndarray]],
-                     interceptor_logs: List[List[np.ndarray]]) -> None:
-    """记录当前时刻飞机、导弹与拦截弹的位置。"""
-    aircraft_log.append(env.observation_planes[0, :3].copy())
-
-    for idx in range(env.missileNum):
-        missile_logs[idx].append(env.observation_missiles[idx, :3].copy())
-
-    for idx in range(len(env.interceptorList)):
-        interceptor_logs[idx].append(env.observation_interceptors[idx, :3].copy())
+def _ensure_array(data: Iterable[float]) -> np.ndarray:
+    return np.asarray(list(data), dtype=np.float32)
 
 
-def run_episode(env, agent: MyDQNAgent, max_steps: Optional[int] = None) -> Tuple[
-    List[np.ndarray], List[List[np.ndarray]], List[List[np.ndarray]], int, str
-]:
-    """运行一局对抗，返回轨迹与结束状态。"""
-    state, _, _ = env.reset()
+def _flatten_interceptors(env) -> List:
+    if hasattr(env, "interceptor_lists"):
+        interceptors = []
+        for group in env.interceptor_lists:
+            interceptors.extend(group)
+        return interceptors
+    if hasattr(env, "interceptorList"):
+        return list(env.interceptorList)
+    return []
 
-    aircraft_log: List[np.ndarray] = []
-    missile_logs: List[List[np.ndarray]] = [[] for _ in range(env.missileNum)]
-    interceptor_logs: List[List[np.ndarray]] = [[] for _ in range(len(env.interceptorList))]
 
-    record_positions(env, aircraft_log, missile_logs, interceptor_logs)
+@dataclass
+class TrajectoryRecorder:
+    """收集飞机、导弹与拦截弹的轨迹数据。"""
 
-    done_flag = -1
-    info = ""
-    steps = 0
+    aircraft_logs: List[List[np.ndarray]]
+    missile_logs: List[List[np.ndarray]]
+    interceptor_logs: List[List[np.ndarray]]
+    aircraft_labels: List[str]
+    missile_labels: List[str]
+    interceptor_labels: List[str]
 
-    while True:
-        if isinstance(state, (list, tuple)):
-            # 单智能体环境仍可能返回列表，取第一个即可
-            current_state = state[0]
+    @classmethod
+    def from_env(cls, env) -> "TrajectoryRecorder":
+        multi_agent = hasattr(env, "num_agents") and env.num_agents > 1
+
+        if hasattr(env, "aircraftList") and isinstance(env.aircraftList, list):
+            aircraft_objects = list(env.aircraftList)
+        elif hasattr(env, "aircraftList"):
+            aircraft_objects = [env.aircraftList]
         else:
-            current_state = state
+            aircraft_objects = []
 
-        current_state = np.asarray(current_state, dtype=np.float32)
-        action = int(agent.predict(current_state))
-        state, _, done_flag, info = env.step(action)
-        record_positions(env, aircraft_log, missile_logs, interceptor_logs)
+        missile_objects = list(getattr(env, "missileList", []))
+        interceptor_objects = _flatten_interceptors(env)
 
+        aircraft_logs = [[] for _ in aircraft_objects]
+        missile_logs = [[] for _ in missile_objects]
+        interceptor_logs = [[] for _ in interceptor_objects]
+
+        if multi_agent:
+            aircraft_labels = [f"Aircraft {idx + 1}" for idx in range(len(aircraft_logs))]
+            interceptor_labels: List[str] = []
+            if hasattr(env, "interceptor_lists"):
+                for plane_idx, group in enumerate(env.interceptor_lists):
+                    for interceptor_idx, _ in enumerate(group):
+                        interceptor_labels.append(
+                            f"Interceptor P{plane_idx + 1}-{interceptor_idx + 1}"
+                        )
+            else:
+                interceptor_labels = [
+                    f"Interceptor {idx + 1}" for idx in range(len(interceptor_logs))
+                ]
+        else:
+            aircraft_labels = ["Aircraft"] if aircraft_logs else []
+            interceptor_labels = [
+                f"Interceptor {idx + 1}" for idx in range(len(interceptor_logs))
+            ]
+
+        missile_labels = [f"Missile {idx + 1}" for idx in range(len(missile_logs))]
+
+        return cls(
+            aircraft_logs=aircraft_logs,
+            missile_logs=missile_logs,
+            interceptor_logs=interceptor_logs,
+            aircraft_labels=aircraft_labels,
+            missile_labels=missile_labels,
+            interceptor_labels=interceptor_labels,
+        )
+
+    def record(self, env) -> None:
+        if hasattr(env, "aircraftList") and isinstance(env.aircraftList, list):
+            aircraft_objects = env.aircraftList
+        elif hasattr(env, "aircraftList"):
+            aircraft_objects = [env.aircraftList]
+        else:
+            aircraft_objects = []
+
+        for idx, plane in enumerate(aircraft_objects):
+            self.aircraft_logs[idx].append(
+                _ensure_array((plane.X, plane.Y, plane.Z))
+            )
+
+        missile_objects = getattr(env, "missileList", [])
+        for idx, missile in enumerate(missile_objects):
+            self.missile_logs[idx].append(
+                _ensure_array((missile.X, missile.Y, missile.Z))
+            )
+
+        interceptors = _flatten_interceptors(env)
+        for idx, interceptor in enumerate(interceptors):
+            self.interceptor_logs[idx].append(
+                _ensure_array((interceptor.X_i, interceptor.Y_i, interceptor.Z_i))
+            )
+
+
+def run_episode(
+    env,
+    agents: Sequence[MyDQNAgent],
+    max_steps: Optional[int] = None,
+):
+    """运行一局对抗，返回轨迹记录、结束标志与提示信息。"""
+
+    multi_agent = hasattr(env, "num_agents") and env.num_agents > 1
+    state, done_flag, info = env.reset()
+    recorder = TrajectoryRecorder.from_env(env)
+    recorder.record(env)
+
+    steps = 0
+    while True:
+        if multi_agent:
+            if not isinstance(state, (list, tuple)):
+                state_batch = [state for _ in agents]
+            else:
+                state_batch = state
+            actions = []
+            for idx, agent in enumerate(agents):
+                current_state = np.asarray(state_batch[idx], dtype=np.float32)
+                actions.append(int(agent.predict(current_state)))
+            state, _, done_flag, info = env.step(actions)
+        else:
+            current_state = np.asarray(state if not isinstance(state, (list, tuple)) else state[0], dtype=np.float32)
+            action = int(agents[0].predict(current_state))
+            state, _, done_flag, info = env.step(action)
+
+        recorder.record(env)
         steps += 1
+
         if done_flag != -1:
             break
         if max_steps is not None and steps >= max_steps:
             break
 
-    return aircraft_log, missile_logs, interceptor_logs, done_flag, info
+    return recorder, done_flag, info
 
 
 def _line_has_motion(points: Sequence[np.ndarray]) -> bool:
@@ -121,9 +246,7 @@ def _line_has_motion(points: Sequence[np.ndarray]) -> bool:
 
 
 def plot_trajectories(
-    aircraft_log: Sequence[np.ndarray],
-    missile_logs: Sequence[Sequence[np.ndarray]],
-    interceptor_logs: Sequence[Sequence[np.ndarray]],
+    recorder: TrajectoryRecorder,
     output_path: Path,
     title: str,
 ) -> None:
@@ -131,56 +254,70 @@ def plot_trajectories(
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    aircraft_points = np.vstack(aircraft_log)
-    ax.plot(
-        aircraft_points[:, 0],
-        aircraft_points[:, 1],
-        aircraft_points[:, 2],
-        color="tab:blue",
-        label="Aircraft",
-        linewidth=2.0,
-    )
-    ax.scatter(
-        aircraft_points[0, 0],
-        aircraft_points[0, 1],
-        aircraft_points[0, 2],
-        color="tab:blue",
-        marker="o",
-        s=60,
-        label="Aircraft Start",
-    )
-    ax.scatter(
-        aircraft_points[-1, 0],
-        aircraft_points[-1, 1],
-        aircraft_points[-1, 2],
-        color="tab:blue",
-        marker="^",
-        s=60,
-        label="Aircraft End",
-    )
+    plane_colors = ["tab:blue", "tab:orange", "tab:purple", "tab:cyan", "tab:pink", "tab:olive"]
 
-    for idx, traj in enumerate(missile_logs):
+    for idx, traj in enumerate(recorder.aircraft_logs):
+        if not traj:
+            continue
+        aircraft_points = np.vstack(traj)
+        color = plane_colors[idx % len(plane_colors)]
+        label = recorder.aircraft_labels[idx] if idx < len(recorder.aircraft_labels) else f"Aircraft {idx + 1}"
+        ax.plot(
+            aircraft_points[:, 0],
+            aircraft_points[:, 1],
+            aircraft_points[:, 2],
+            color=color,
+            label=label,
+            linewidth=2.0,
+        )
+        ax.scatter(
+            aircraft_points[0, 0],
+            aircraft_points[0, 1],
+            aircraft_points[0, 2],
+            color=color,
+            marker="o",
+            s=60,
+            label=f"{label} Start",
+        )
+        ax.scatter(
+            aircraft_points[-1, 0],
+            aircraft_points[-1, 1],
+            aircraft_points[-1, 2],
+            color=color,
+            marker="^",
+            s=60,
+            label=f"{label} End",
+        )
+
+    for idx, traj in enumerate(recorder.missile_logs):
         if not _line_has_motion(traj):
             continue
         missile_points = np.vstack(traj)
+        label = recorder.missile_labels[idx] if idx < len(recorder.missile_labels) else f"Missile {idx + 1}"
         ax.plot(
             missile_points[:, 0],
             missile_points[:, 1],
             missile_points[:, 2],
             linestyle="--",
-            label=f"Missile {idx + 1}",
+            color="tab:red",
+            label=label,
         )
 
-    for idx, traj in enumerate(interceptor_logs):
+    for idx, traj in enumerate(recorder.interceptor_logs):
         if not _line_has_motion(traj):
             continue
         interceptor_points = np.vstack(traj)
+        label = (
+            recorder.interceptor_labels[idx]
+            if idx < len(recorder.interceptor_labels)
+            else f"Interceptor {idx + 1}"
+        )
         ax.plot(
             interceptor_points[:, 0],
             interceptor_points[:, 1],
             interceptor_points[:, 2],
             color="tab:green",
-            label=f"Interceptor {idx + 1}",
+            label=label,
         )
 
     ax.set_title(title)
@@ -208,7 +345,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--num-missiles", type=int, default=4, help="来袭导弹数量")
     parser.add_argument("--step-num", type=int, default=3500, help="最大仿真步数")
-    parser.add_argument("--interceptors", type=int, default=6, help="拦截弹数量")
+    parser.add_argument("--num-aircraft", type=int, default=2, help="协同飞机数量(<=1表示单机)")
+    parser.add_argument(
+        "--interceptors",
+        type=int,
+        default=6,
+        help="每架飞机的拦截弹数量（单机模式即总数）",
+    )
     parser.add_argument(
         "--output", default="outputs/trajectory.png", help="三维轨迹图输出路径"
     )
@@ -222,20 +365,23 @@ def main() -> None:
     args = parse_args()
     set_global_seed(args.seed)
 
+    interceptors_total = (
+        args.interceptors if args.num_aircraft <= 1 else args.interceptors * args.num_aircraft
+    )
+
     env, _, _ = init_env(
         num_missiles=args.num_missiles,
         StepNum=args.step_num,
-        interceptor_num=args.interceptors,
-        num_aircraft=1,
+        interceptor_num=interceptors_total,
+        num_aircraft=args.num_aircraft,
+        interceptors_per_plane=args.interceptors if args.num_aircraft > 1 else None,
     )
 
-    state_size = env._getNewStateSpace()[0]
-    action_size = env._get_actSpace()
-    agent = build_agent(state_size, action_size)
-    load_checkpoint(agent, args.checkpoint)
+    agents = build_agents(env)
+    load_checkpoint(agents, args.checkpoint)
 
-    aircraft_log, missile_logs, interceptor_logs, done_flag, info = run_episode(
-        env, agent, max_steps=args.max_steps
+    recorder, done_flag, info = run_episode(
+        env, agents, max_steps=args.max_steps
     )
 
     ending = {
@@ -249,7 +395,7 @@ def main() -> None:
         title = f"{title}\n{info}"
 
     output_path = Path(args.output)
-    plot_trajectories(aircraft_log, missile_logs, interceptor_logs, output_path, title)
+    plot_trajectories(recorder, output_path, title)
     print(f"轨迹图已保存至: {output_path}")
 
 
