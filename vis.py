@@ -335,6 +335,7 @@ def save_trajectory_gif(
             else f"Aircraft {idx + 1}"
         )
         (line,) = ax.plot([], [], [], color=color, linewidth=2.0, label=label)
+        line.set_zorder(5)
         line_handles.append((line, traj))
 
     for idx, traj in enumerate(recorder.missile_logs):
@@ -344,6 +345,7 @@ def save_trajectory_gif(
             else f"Missile {idx + 1}"
         )
         (line,) = ax.plot([], [], [], linestyle="--", color="tab:red", label=label)
+        line.set_zorder(3)
         line_handles.append((line, traj))
 
     for idx, traj in enumerate(recorder.interceptor_logs):
@@ -353,6 +355,7 @@ def save_trajectory_gif(
             else f"Interceptor {idx + 1}"
         )
         (line,) = ax.plot([], [], [], color="tab:green", label=label)
+        line.set_zorder(2)
         line_handles.append((line, traj))
 
     handles, labels = ax.get_legend_handles_labels()
