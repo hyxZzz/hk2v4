@@ -22,11 +22,12 @@ ERRACTIONSCALE = 1.2 # 惩罚加的系数 原先设为10
 DANGERSCALE = 2.5 # 危险情况下 距离影响的系数 原先设为5
 CURIOSITYSCALE = 0.5 #  好奇心加数 鼓励探索
 
-SUCCESS_INTERCEPT_REWARD = 3.5 * SPARSE_REWARD_SCALE
-SUCCESS_ESCAPE_REWARD = 2.5 * SPARSE_REWARD_SCALE
-FAILURE_PENALTY = -3.0 * SPARSE_REWARD_SCALE
-MISSILE_PROGRESS_REWARD = 0.6 * SPARSE_REWARD_SCALE
-PER_STEP_MISSILE_PENALTY = 0.04 * SPARSE_REWARD_SCALE
+SUCCESS_INTERCEPT_REWARD = 4.5 * SPARSE_REWARD_SCALE
+SUCCESS_ESCAPE_REWARD = 1.25 * SPARSE_REWARD_SCALE
+FAILURE_PENALTY = -3.2 * SPARSE_REWARD_SCALE
+MISSILE_PROGRESS_REWARD = 0.85 * SPARSE_REWARD_SCALE
+PER_STEP_MISSILE_PENALTY = 0.08 * SPARSE_REWARD_SCALE
+UNCOVERED_THREAT_PENALTY = 0.6 * SPARSE_REWARD_SCALE
 class ManeuverEnv:
     """
                         导弹编号	    X位置	Y位置	Z位置	速度	    俯仰角	偏转角
@@ -1282,6 +1283,27 @@ class CooperativeManeuverEnv:
         intercept_success = self._update_interceptors(missile_positions)
 
         active_missiles = sum(1 for missile in self.missileList if missile.attacking)
+        uncovered_threats = 0
+        coverage_radius = DANGER_DISTANCE * 0.75
+        for idx, missile in enumerate(self.missileList):
+            if not missile.attacking:
+                continue
+            target_idx = missile.target_id if missile.target_id is not None else 0
+            plane = self.aircraftList[target_idx]
+            distance_to_plane = CalDistance(
+                [plane.X, plane.Y, plane.Z], missile_positions[idx]
+            )
+            has_cover = False
+            for interceptors in self.interceptor_lists:
+                for interceptor in interceptors:
+                    if interceptor.T_i == idx and interceptor.attacking == 0:
+                        has_cover = True
+                        break
+                if has_cover:
+                    break
+            if distance_to_plane < coverage_radius and not has_cover:
+                uncovered_threats += 1
+
         if active_missiles == 0 and self.escapeFlag == -1:
             self.escapeFlag = 2
             info = 'Intercept Success'
@@ -1300,10 +1322,11 @@ class CooperativeManeuverEnv:
         progress_ratio = neutralized / max(self.initial_missile_count, 1)
 
         reward = altitude_reward
-        reward -= 0.35 * distance_penalty
-        reward += 0.9 * intercept_success
+        reward -= 0.25 * distance_penalty
+        reward += 1.3 * intercept_success
         reward += MISSILE_PROGRESS_REWARD * progress_ratio
         reward -= PER_STEP_MISSILE_PENALTY * active_missiles
+        reward -= UNCOVERED_THREAT_PENALTY * uncovered_threats
         reward += invalid_penalty + launch_penalty
 
         if self.escapeFlag == 0:
