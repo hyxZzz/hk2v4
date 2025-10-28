@@ -36,6 +36,8 @@ class MyDQNAgent:
         min_epsilon=0.1,
         update_target_steps=15,
         soft_update_tau=0.0,
+        grad_clip=10.0,
+        use_huber_loss=True,
     ):
 
         self.action_size = action_size
@@ -49,7 +51,10 @@ class MyDQNAgent:
         self.target_model = copy.deepcopy(model).to(device)
         self.gamma = gamma  # 回报折扣因子
         self.lr = lr
-        self.mse_loss = nn.MSELoss(reduction='mean')
+        self.loss_fn = (
+            nn.SmoothL1Loss(reduction='mean') if use_huber_loss else nn.MSELoss(reduction='mean')
+        )
+        self.grad_clip = float(grad_clip) if grad_clip is not None else None
         self.optimizer = optim.Adam(lr=lr, params=self.model.parameters())
 
     def _update_target_model(self):
@@ -125,13 +130,15 @@ class MyDQNAgent:
             target = reward + (1.0 - done) * self.gamma * max_next_q
 
         # 4. TD 误差
-        loss = self.mse_loss(pred_value, target)
+        loss = self.loss_fn(pred_value, target)
 
         # 5. 更新DQN的参数
         # 梯度清零
         self.optimizer.zero_grad()
         # 反向计算梯度
         loss.backward()
+        if self.grad_clip is not None:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         # 梯度更新
         self.optimizer.step()
 

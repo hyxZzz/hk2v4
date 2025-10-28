@@ -18,9 +18,15 @@ MISSILE_HIT_DISTANCE = 20.0  # 来袭导弹命中飞机的阈值
 SPARSE_REWARD_SCALE = 0.75  # 稀疏奖励的尺度
 DANGER_DISTANCE = 3000 # 危险距离 用于奖励函数的非线性分段
 LanchGap = 70 # 发射间隔
-ERRACTIONSCALE = 2 # 惩罚加的系数 原先设为10
-DANGERSCALE = 3 # 危险情况下 距离影响的系数 原先设为5
+ERRACTIONSCALE = 1.2 # 惩罚加的系数 原先设为10
+DANGERSCALE = 2.5 # 危险情况下 距离影响的系数 原先设为5
 CURIOSITYSCALE = 0.5 #  好奇心加数 鼓励探索
+
+SUCCESS_INTERCEPT_REWARD = 3.5 * SPARSE_REWARD_SCALE
+SUCCESS_ESCAPE_REWARD = 2.5 * SPARSE_REWARD_SCALE
+FAILURE_PENALTY = -3.0 * SPARSE_REWARD_SCALE
+MISSILE_PROGRESS_REWARD = 0.6 * SPARSE_REWARD_SCALE
+PER_STEP_MISSILE_PENALTY = 0.04 * SPARSE_REWARD_SCALE
 class ManeuverEnv:
     """
                         导弹编号	    X位置	Y位置	Z位置	速度	    俯仰角	偏转角
@@ -47,6 +53,7 @@ class ManeuverEnv:
             空间大小    spaceSize，[Maxstep]
         """
         self.missileNum = missilesNum
+        self.initial_missile_count = missilesNum
         self.missileSpeed = missilesSpeed
         self.planeSpeed = planeSpeed
         self.interceptorNum = InterceptorNum
@@ -453,18 +460,17 @@ class ManeuverEnv:
             """
         for i in range(len(self.interceptorList)):
             target_index = self.interceptorList[i].T_i
-            # 发射了拦截弹的目标
             if target_index != -1:
-                # 与发射目标的原始距离
                 D0 = abs(self.D0[target_index])
-                # 与发射目标的实时距离
                 D = abs(np.linalg.norm((missileState[target_index] - planeState)))
-                # 如果距离大于一半 惩罚
-                if D > D0 / 2:
-                    rd -= 0.4
-                    # 如果当前动作是发射远距离的导弹 这一步视为错误
+                launch_threshold = max(D0 * 0.65, DANGER_DISTANCE * 0.5)
+                if D > launch_threshold:
+                    overflow_ratio = min((D - launch_threshold) / max(launch_threshold, 1.0), 1.0)
+                    rd -= 0.25 * overflow_ratio
                     if interceptor_goal == target_index:
-                        rd -= ERRACTIONSCALE
+                        rd -= ERRACTIONSCALE * 0.4 * overflow_ratio
+                elif interceptor_goal == target_index:
+                    rd += 0.35
 
 
 
@@ -513,7 +519,7 @@ class ManeuverEnv:
                 focus_penalty = idle_interceptors / active_missiles
                 if interceptor_goal not in (-1, missile_index):
                     focus_penalty += 1 / active_missiles
-                rm = -DANGERSCALE * focus_penalty
+                rm = -0.5 * DANGERSCALE * focus_penalty
         rd += rm
 
         """
@@ -616,20 +622,22 @@ class ManeuverEnv:
         """
 
     def SparseReward(self):
-        rd = 0
-        C4 = SPARSE_REWARD_SCALE
+        rd = 0.0
+        active_missiles = self.getRemainMissileNum()
+        neutralized = max(self.initial_missile_count - active_missiles, 0)
+        progress_ratio = neutralized / max(self.initial_missile_count, 1)
 
-        # C4 = 100
         if self.escapeFlag == -1:
             dist, _ = self.getClosetMissileDist()
             danger_multiplier = 1.0 if dist <= DANGER_DISTANCE else 0.5
-            rd = - 0.06 * C4 * danger_multiplier * self.getRemainMissileNum() # 每一颗存在的导弹都要有惩罚
+            rd -= PER_STEP_MISSILE_PENALTY * danger_multiplier * active_missiles
+            rd += MISSILE_PROGRESS_REWARD * progress_ratio
         elif self.escapeFlag == 0:
-            rd = - C4
+            rd = FAILURE_PENALTY
         elif self.escapeFlag == 1:
-            rd = C4
+            rd = SUCCESS_ESCAPE_REWARD + MISSILE_PROGRESS_REWARD * progress_ratio
         elif self.escapeFlag == 2:
-            rd = C4
+            rd = SUCCESS_INTERCEPT_REWARD + MISSILE_PROGRESS_REWARD * progress_ratio
 
         return rd
 
@@ -834,6 +842,7 @@ class ManeuverEnv:
         missileList, aircraftList, planeSpeed, missiles_num, spaceSize, missilesSpeed = reset_para(
             num_missiles=missilesNum)
         self.missileNum = missilesNum
+        self.initial_missile_count = missilesNum
         self.missileSpeed = missilesSpeed
         self.planeSpeed = planeSpeed
         self.missileList = missileList
@@ -982,6 +991,7 @@ class CooperativeManeuverEnv:
         self.action_space = [spaces.Discrete(getActionDepository(missilesNum, act_num).shape[0]) for _ in range(self.num_agents)]
         self.spaceSize = spaceSize
         self.missileNum = missilesNum
+        self.initial_missile_count = missilesNum
         self.missileSpeed = missilesSpeed
         self.interceptorSpeed = interceptorSpeed
         self.interceptors_per_plane = interceptors_per_plane
@@ -992,6 +1002,7 @@ class CooperativeManeuverEnv:
 
     def _build_from_state(self, missile_list: List[Missiles], aircraft_list: List[Aircraft]):
         self.missileList = missile_list
+        self.initial_missile_count = len(missile_list)
         self.aircraftList = aircraft_list
         self.interceptor_lists = []
         self.interceptor_remain = []
@@ -1285,16 +1296,22 @@ class CooperativeManeuverEnv:
 
         distance_penalty = self._distance_penalty()
         altitude_reward = self._altitude_reward()
+        neutralized = max(self.initial_missile_count - active_missiles, 0)
+        progress_ratio = neutralized / max(self.initial_missile_count, 1)
 
-        reward = -0.4 * distance_penalty + 1.2 * intercept_success + altitude_reward
+        reward = altitude_reward
+        reward -= 0.35 * distance_penalty
+        reward += 0.9 * intercept_success
+        reward += MISSILE_PROGRESS_REWARD * progress_ratio
+        reward -= PER_STEP_MISSILE_PENALTY * active_missiles
         reward += invalid_penalty + launch_penalty
 
         if self.escapeFlag == 0:
-            reward -= 2.0
+            reward += FAILURE_PENALTY
         elif self.escapeFlag == 1:
-            reward += 1.5
+            reward += SUCCESS_ESCAPE_REWARD
         elif self.escapeFlag == 2:
-            reward += 2.0
+            reward += SUCCESS_INTERCEPT_REWARD
 
         states, _ = self._get_agent_observations()
         rewards = [reward for _ in range(self.num_agents)]
