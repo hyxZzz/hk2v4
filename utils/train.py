@@ -199,13 +199,13 @@ def main():
     parser.add_argument(
         '--target_update_freq',
         type=int,
-        default=200,
+        default=40,
         help='Number of learning steps between target network updates',
     )
     parser.add_argument(
         '--target_update_tau',
         type=float,
-        default=0.05,
+        default=0.2,
         help='Soft update coefficient for target network (0 for hard update)',
     )
     parser.add_argument(
