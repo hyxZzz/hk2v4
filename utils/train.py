@@ -199,13 +199,13 @@ def main():
     parser.add_argument(
         '--target_update_freq',
         type=int,
-        default=800,
+        default=200,
         help='Number of learning steps between target network updates',
     )
     parser.add_argument(
         '--target_update_tau',
         type=float,
-        default=0.015,
+        default=0.05,
         help='Soft update coefficient for target network (0 for hard update)',
     )
     parser.add_argument(
@@ -272,6 +272,7 @@ def main():
             min_epsilon=epsilon_end,
             update_target_steps=args.target_update_freq,
             soft_update_tau=args.target_update_tau,
+            grad_clip=5.0,
         )
         agents.append(agent)
 
