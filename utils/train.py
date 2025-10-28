@@ -272,6 +272,7 @@ def main():
             min_epsilon=epsilon_end,
             update_target_steps=args.target_update_freq,
             soft_update_tau=args.target_update_tau,
+            grad_clip=5.0,
         )
         agents.append(agent)
 
